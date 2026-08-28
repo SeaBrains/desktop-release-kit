@@ -121,7 +121,7 @@ jobs:
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -129,7 +129,7 @@ jobs:
           sparse-checkout: scripts
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -166,7 +166,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
@@ -188,7 +188,7 @@ jobs:
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release kit
-        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -196,7 +196,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -337,7 +337,7 @@ jobs:
 
       - name: Upload macOS manifest artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: mac-manifest-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/mac-release/latest-mac.yml
@@ -352,7 +352,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
@@ -371,7 +371,7 @@ jobs:
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release kit
-        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -379,7 +379,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -426,7 +426,7 @@ jobs:
       # private, no extra credentials on the self-hosted sign runner.
       - name: Upload unsigned app artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-unpacked-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked/
@@ -456,14 +456,14 @@ jobs:
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -473,7 +473,7 @@ jobs:
 
       - name: Download unsigned app artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-unpacked-${{ env.DESKTOP_VERSION }}
           path: win-unpacked
@@ -494,7 +494,7 @@ jobs:
 
       - name: Upload signed app artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
           path: win-unpacked/
@@ -511,7 +511,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
@@ -530,7 +530,7 @@ jobs:
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release kit
-        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -538,7 +538,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -576,7 +576,7 @@ jobs:
 
       - name: Download signed app artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked
@@ -634,7 +634,7 @@ jobs:
 
       - name: Upload unsigned installer artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: installer-unsigned-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/${{ env.INSTALLER_PREFIX }}-*-Setup.exe
@@ -664,7 +664,7 @@ jobs:
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -673,7 +673,7 @@ jobs:
       # The self-hosted sign runner is a bare machine with no preinstalled
       # toolchain — install Node here (the scripts below run under `node`).
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -695,7 +695,7 @@ jobs:
 
       - name: Download unsigned installer artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: installer-unsigned-${{ env.DESKTOP_VERSION }}
           path: dist
@@ -774,7 +774,7 @@ jobs:
 
       - name: Upload Windows manifest artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-manifest-${{ env.DESKTOP_VERSION }}
           path: dist/latest.yml
@@ -802,7 +802,7 @@ jobs:
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ steps.kit.outputs.repository }}
           ref: ${{ steps.kit.outputs.ref }}
@@ -810,7 +810,7 @@ jobs:
           sparse-checkout: scripts
 
       - name: Setup Node
-        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ inputs['node-version'] }}
 
@@ -825,14 +825,14 @@ jobs:
 
       - name: Download macOS manifest artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: mac-manifest-${{ env.DESKTOP_VERSION }}
           path: manifests/mac
 
       - name: Download Windows manifest artifact
         if: env.IS_SMOKE_TAG != 'true'
-        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-manifest-${{ env.DESKTOP_VERSION }}
           path: manifests/win

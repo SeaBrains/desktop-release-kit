@@ -119,9 +119,21 @@ jobs:
 
 `node-version`（默认 `22.23.2`）、`tag-prefix`（默认 `desktop-v`）、`upstream-manifest` / `upstream-submodule`（默认空，跳过 pin 校验）、`verify-published-bytes`（默认 `2000000`；设 `0` 则完整下载并逐个校验 sha512，慢但最严）可省略。
 
-## 3. Org secrets
+## 3. Secrets
 
-`APPLE_CERTIFICATE`（p12）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`、`MAC_CSC_NAME`、`CF_R2_ACCESS_KEY_ID`、`CF_R2_SECRET_ACCESS_KEY`、`JENKINS_SIGN_URL`、`JENKINS_SIGN_USER`、`JENKINS_SIGN_TOKEN`。
+11 个：`APPLE_CERTIFICATE`（p12 的 base64）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`（应用专用密码）、`APPLE_TEAM_ID`、`MAC_CSC_NAME`、`CF_R2_ACCESS_KEY_ID`、`CF_R2_SECRET_ACCESS_KEY`、`JENKINS_SIGN_URL`、`JENKINS_SIGN_USER`、`JENKINS_SIGN_TOKEN`。
+
+**配在 repo 级，不要只配 org 级。** GitHub Free 计划的组织里，org secret 的 `visibility: private` / `selected` 对 private 仓库**不生效** —— API 能创建、能查到，但运行时注入的是空字符串。只有 `all` 且仓库是 public 才有效。
+
+这个坑很隐蔽，因为解析优先级是 **repo > environment > org**：org 级配好时被 repo 级同名遮蔽，看不出问题；**删掉 repo 级才是对 org 级的第一次真实验证**。删完才发现不可用时，repo 级的值已经读不回来了（GitHub 不返回明文），只能从本地备份或原始渠道重取。
+
+先确认计划等级再决定：
+
+```bash
+gh api orgs/<org> -q '.plan.name'   # free → 必须 repo 级；team/enterprise → 可用 org 级
+```
+
+失败特征：日志里 `CSC_LINK:` 后面是**空的**（而不是报值错误），签名步骤 2 秒内挂在 `A valid Developer ID Application certificate ... is required`。
 
 Caller 的 `GITHUB_TOKEN` 需能读取本 kit（公开仓库，或同 org 允许访问 private repo）。R2 走 org Cloudflare 账户 endpoint。
 
