@@ -1,0 +1,973 @@
+name: Desktop Release
+
+on:
+  workflow_call:
+    inputs:
+      product-slug:
+        required: true
+        type: string
+      workspace:
+        required: true
+        type: string
+      package-path:
+        required: true
+        type: string
+      installer-prefix:
+        required: true
+        type: string
+      executable-name:
+        required: true
+        type: string
+      r2-bucket:
+        required: true
+        type: string
+      downloads-base:
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "22.23.2"
+      tag-prefix:
+        required: false
+        type: string
+        default: "desktop-v"
+      upstream-manifest:
+        description: "Optional JSON file whose .commit must match the submodule index. Checked before packaging."
+        required: false
+        type: string
+        default: ""
+      upstream-submodule:
+        description: "Submodule path guarded by upstream-manifest."
+        required: false
+        type: string
+        default: ""
+      verify-published-bytes:
+        description: "Bytes to stream from each published artifact when checking the CDN. 0 downloads and hashes in full."
+        required: false
+        type: number
+        default: 2000000
+    secrets:
+      APPLE_CERTIFICATE:
+        required: true
+      APPLE_CERTIFICATE_PASSWORD:
+        required: true
+      APPLE_ID:
+        required: true
+      APPLE_PASSWORD:
+        required: true
+      APPLE_TEAM_ID:
+        required: true
+      MAC_CSC_NAME:
+        required: true
+      CF_R2_ACCESS_KEY_ID:
+        required: true
+      CF_R2_SECRET_ACCESS_KEY:
+        required: true
+      JENKINS_SIGN_URL:
+        required: true
+      JENKINS_SIGN_USER:
+        required: true
+      JENKINS_SIGN_TOKEN:
+        required: true
+
+concurrency:
+  group: desktop-release-${{ inputs['product-slug'] }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  DESKTOP_WORKSPACE: ${{ inputs.workspace }}
+  DESKTOP_PACKAGE_PATH: ${{ inputs['package-path'] }}
+  PRODUCT_SLUG: ${{ inputs['product-slug'] }}
+  INSTALLER_PREFIX: ${{ inputs['installer-prefix'] }}
+  RELEASE_EXECUTABLE_NAME: ${{ inputs['executable-name'] }}
+  R2_BUCKET: ${{ inputs['r2-bucket'] }}
+  R2_ENDPOINT: https://75615ad798eee20d0c0fa5cfb354ced6.r2.cloudflarestorage.com
+  DOWNLOADS_BASE: ${{ inputs['downloads-base'] }}
+  RELEASE_TAG_PREFIX: ${{ inputs['tag-prefix'] }}
+  # job_workflow_ref is the called kit workflow (owner/kit/.github/workflows/release.yml@ref).
+  # Never fall back to github.workflow_ref (the caller) — that would checkout
+  # the product repo on sign runners.
+  KIT_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+
+jobs:
+  create-release:
+    if: ${{ (github.event_name == 'push' && !startsWith(github.ref_name, 'desktop-macos-v') && !startsWith(github.ref_name, 'desktop-windows-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.platform == 'all') }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          fail() { echo "::error ::$*"; exit 1; }
+          [[ "$PRODUCT_SLUG" =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || fail "product-slug must match ^[a-z0-9][a-z0-9-]{1,40}$"
+          [[ "$R2_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,62}$ ]] || fail "r2-bucket must match ^[a-z0-9][a-z0-9.-]{1,62}$"
+          name_ok() { [[ "$1" =~ ^[^/\\$\`\"\'[:space:]]+$ ]]; }
+          name_ok "$INSTALLER_PREFIX" || fail "installer-prefix must not contain / \\ \$ \` \" ' or whitespace"
+          name_ok "$RELEASE_EXECUTABLE_NAME" || fail "executable-name must not contain / \\ \$ \` \" ' or whitespace"
+
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        if: env.IS_SMOKE_TAG != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists, skipping creation"
+          else
+            prerelease_flag=""
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              prerelease_flag="--prerelease"
+            fi
+            gh release create "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "$INSTALLER_PREFIX $RELEASE_TAG" \
+              --generate-notes \
+              $prerelease_flag
+          fi
+
+  publish-macos:
+    needs: [create-release]
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'macos')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, inputs['tag-prefix']) || startsWith(github.ref_name, 'desktop-macos-v')))) }}
+    permissions:
+      contents: read
+      packages: read
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          # Product repos that vendor an upstream checkout (e.g. a git submodule)
+          # need it present for layout/release gates. Caller owns the pin.
+          submodules: recursive
+
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release kit
+        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          path: .release-kit
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node .release-kit/scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+      # Signing and notarization take ~20 minutes, so reject a stale upstream pin
+      # now rather than letting the product's own layout gate catch it afterwards.
+      - name: Verify upstream submodule pin
+        if: inputs['upstream-manifest'] != '' && inputs['upstream-submodule'] != ''
+        shell: bash
+        run: |
+          node .release-kit/scripts/verify-submodule-pins.mjs \
+            --manifest "${{ inputs['upstream-manifest'] }}" \
+            --submodule "${{ inputs['upstream-submodule'] }}"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Set desktop package version from tag
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const version = process.env.DESKTOP_VERSION;
+          if (!version) throw new Error('DESKTOP_VERSION env var is missing');
+
+          // The desktop package gate asserts its version matches the root
+          // workspace manifest, so stamp both.
+          for (const packageJsonPath of [
+            path.join(process.env.DESKTOP_PACKAGE_PATH, 'package.json'),
+            'package.json',
+          ]) {
+            const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+            packageJson.version = version;
+            fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+          }
+          NODE
+
+      - name: Build workspace dependencies
+        run: yarn build
+
+      - name: Build signed and notarized macOS DMG
+        shell: bash
+        env:
+          # macOS signing via electron-builder's CSC_LINK p12 path. The desktop
+          # release-preflight additionally expects CSC_NAME (certificate common
+          # name without the "Developer ID Application:" prefix) to select it.
+          CSC_LINK: ${{ secrets.APPLE_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          CSC_NAME: ${{ secrets.MAC_CSC_NAME }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # electron-builder downloads its own toolchain separately from the
+          # Electron binary; pin to the canonical GitHub releases source.
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+        # asarUnpack ships node_modules as loose files; packaging and signing
+        # them exceeds the macOS runner's descriptor budget (EMFILE). ulimit
+        # alone is silently capped by kern.maxfilesperproc, so raise the
+        # kernel caps first.
+        run: |
+          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=262144
+          ulimit -n 262144
+          ulimit -n
+          yarn workspace "$DESKTOP_WORKSPACE" dist:mac
+
+      # A correctly signed, notarized build can still ship an update that never
+      # installs, and nothing downstream would notice: the pipeline goes green and
+      # the failure only surfaces on a user's machine. Assert the two macOS install
+      # handoff contracts against the packaged bundle before publishing it.
+      - name: Verify macOS updater contract
+        shell: bash
+        run: |
+          app="$(find "$DESKTOP_PACKAGE_PATH/dist/mac-release" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app" ]]; then
+            echo "::error ::No .app bundle found under $DESKTOP_PACKAGE_PATH/dist/mac-release"
+            exit 1
+          fi
+          node .release-kit/scripts/verify-updater-contract.mjs --app-root "$app"
+
+      - name: Upload to R2
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+        run: |
+          shopt -s nullglob
+          dmgs=("$DESKTOP_PACKAGE_PATH/dist/mac-release/"*.dmg)
+          if [[ ${#dmgs[@]} -eq 0 || ! -f "${dmgs[0]}" ]]; then
+            echo "::error ::No macOS DMG produced by the release build."
+            exit 1
+          fi
+          for f in "$DESKTOP_PACKAGE_PATH/dist/mac-release/"*.dmg \
+                   "$DESKTOP_PACKAGE_PATH/dist/mac-release/"*.zip \
+                   "$DESKTOP_PACKAGE_PATH/dist/mac-release/"*.blockmap; do
+            [ -f "$f" ] || continue
+            node .release-kit/scripts/r2-put.mjs \
+              --file "$f" \
+              --bucket "$R2_BUCKET" \
+              --key "$PRODUCT_SLUG/$DESKTOP_VERSION/$(basename "$f")" \
+              --endpoint "$R2_ENDPOINT" \
+              --immutable
+          done
+
+      - name: Install manifest dependency
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        run: npm install --prefix .release-kit/scripts --no-save --no-package-lock yaml@2
+
+      - name: Prepare macOS auto-updater manifest
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          manifest="$DESKTOP_PACKAGE_PATH/dist/mac-release/latest-mac.yml"
+          if [[ ! -f "$manifest" ]]; then
+            echo "::error ::No latest-mac.yml produced by the release build."
+            exit 1
+          fi
+          # electron-builder writes the zip (and optional dmg) into latest-mac.yml.
+          # Rewrite files[].url to ${version}/<file> so electron-updater can fetch
+          # from feed URL ${DOWNLOADS_BASE}/${PRODUCT_SLUG}.
+          export NODE_PATH="$GITHUB_WORKSPACE/.release-kit/scripts/node_modules"
+          if ! node -e "const {parse}=require('yaml');const m=parse(require('fs').readFileSync(process.argv[1],'utf8'));if(!Array.isArray(m.files)||!m.files.some(f=>typeof f?.url==='string'&&f.url.endsWith('.zip')))process.exit(1)" "$manifest"; then
+            echo "::error ::latest-mac.yml must list a zip artifact for electron-updater."
+            exit 1
+          fi
+          node .release-kit/scripts/prepare-desktop-update-manifest.mjs \
+            --manifest "$manifest" \
+            --version "$DESKTOP_VERSION"
+
+      - name: Upload macOS manifest artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: mac-manifest-${{ env.DESKTOP_VERSION }}
+          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/mac-release/latest-mac.yml
+          retention-days: 1
+
+  publish-windows:
+    needs: [create-release]
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') && ((github.event_name == 'workflow_dispatch' && (github.event.inputs.platform == 'all' || github.event.inputs.platform == 'windows')) || (github.event_name == 'push' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, inputs['tag-prefix']) || startsWith(github.ref_name, 'desktop-windows-v')))) }}
+    permissions:
+      contents: read
+      packages: read
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release kit
+        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          path: .release-kit
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node .release-kit/scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Set desktop package version from tag
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const version = process.env.DESKTOP_VERSION;
+          if (!version) throw new Error('DESKTOP_VERSION env var is missing');
+
+          // The desktop package gate asserts its version matches the root
+          // workspace manifest, so stamp both.
+          for (const packageJsonPath of [
+            path.join(process.env.DESKTOP_PACKAGE_PATH, 'package.json'),
+            'package.json',
+          ]) {
+            const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+            packageJson.version = version;
+            fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+          }
+          NODE
+
+      - name: Build workspace dependencies
+        run: yarn build
+
+      - name: Build unsigned Windows win-unpacked directory
+        shell: bash
+        run: yarn workspace "$DESKTOP_WORKSPACE" dist:win-unpacked
+
+      # The unsigned app travels to the signing stage via a run-scoped artifact:
+      # private, no extra credentials on the self-hosted sign runner.
+      - name: Upload unsigned app artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-unpacked-${{ env.DESKTOP_VERSION }}
+          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked/
+          retention-days: 1
+
+  # The Jenkins signing runner can reach the private signing service, while the
+  # hosted Windows builder cannot. Sign the app directory before NSIS packs it.
+  # This job never checkouts the product repo — only the kit (scripts) plus
+  # the unsigned artifact.
+  sign-windows-app:
+    needs: [publish-windows]
+    if: ${{ always() && needs.publish-windows.result == 'success' }}
+    runs-on: sign
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Download unsigned app artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-unpacked-${{ env.DESKTOP_VERSION }}
+          path: win-unpacked
+
+      - name: Sign app executables via Jenkins
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          JENKINS_URL: ${{ secrets.JENKINS_SIGN_URL }}
+          JENKINS_USER: ${{ secrets.JENKINS_SIGN_USER }}
+          JENKINS_TOKEN: ${{ secrets.JENKINS_SIGN_TOKEN }}
+        run: |
+          app_root="win-unpacked"
+          node scripts/list-windows-signing-targets.mjs --root "$app_root" > signing-targets.txt
+          while IFS= read -r exe; do
+            node scripts/sign-windows-via-jenkins.mjs --exe "$exe"
+          done < signing-targets.txt
+
+      - name: Upload signed app artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
+          path: win-unpacked/
+          retention-days: 1
+
+  # Build the NSIS installer on Windows from the signed app directory. The
+  # verification here prevents publishing an installer with unsigned core EXEs.
+  package-windows-installer:
+    needs: [sign-windows-app]
+    if: ${{ always() && needs.sign-windows-app.result == 'success' }}
+    permissions:
+      contents: read
+      packages: read
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release kit
+        uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          path: .release-kit
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node .release-kit/scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Set desktop package version from tag
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const version = process.env.DESKTOP_VERSION;
+          if (!version) throw new Error('DESKTOP_VERSION env var is missing');
+
+          // The desktop package gate asserts its version matches the root
+          // workspace manifest, so stamp both.
+          for (const packageJsonPath of [
+            path.join(process.env.DESKTOP_PACKAGE_PATH, 'package.json'),
+            'package.json',
+          ]) {
+            const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+            packageJson.version = version;
+            fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+          }
+          NODE
+
+      - name: Download signed app artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
+          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked
+
+      - name: Verify signed app executables
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: pwsh
+        run: |
+          $appRoot = Join-Path $env:DESKTOP_PACKAGE_PATH 'dist/win-unpacked'
+          $targets = @(node .release-kit/scripts/list-windows-signing-targets.mjs --root $appRoot)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve Windows signing targets.' }
+          foreach ($target in $targets) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $target
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
+              throw "Unsigned or invalid signature: $target ($($signature.Status))"
+            }
+          }
+
+      - name: Package signed app as NSIS installer
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        run: yarn workspace "$DESKTOP_WORKSPACE" dist:win-installer
+
+      - name: Verify signed payload inside installer
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: pwsh
+        run: |
+          # electron-builder rewrites payload files during NSIS packing (it
+          # replaced a Jenkins-signed elevate.exe with its own unsigned copy).
+          # The pre-pack verification above cannot see that, so re-verify the
+          # bytes actually shipped inside the installer. NSIS nests the app
+          # files in $PLUGINSDIR/app-64.7z — extract two levels.
+          $installer = Get-ChildItem "$env:DESKTOP_PACKAGE_PATH/dist/${env:INSTALLER_PREFIX}-*-Setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw 'No installer exe found to verify' }
+          $outer = Join-Path $env:RUNNER_TEMP 'installer-outer'
+          & 7z x $installer.FullName "-o$outer" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '7z extraction of installer failed' }
+          # useZip: true packs app-64.zip instead of the 7z default.
+          $appArchive = @('app-64.zip', 'app-64.7z') |
+            ForEach-Object { Join-Path $outer "`$PLUGINSDIR/$_" } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $appArchive) { throw "app-64.zip / app-64.7z not found in extracted installer" }
+          $payload = Join-Path $env:RUNNER_TEMP 'installer-payload'
+          & 7z x $appArchive "-o$payload" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '7z extraction of app-64.7z failed' }
+          $targets = @(node .release-kit/scripts/list-windows-signing-targets.mjs --root $payload)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve signing targets in extracted payload.' }
+          foreach ($target in $targets) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $target
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
+              throw "Unsigned or invalid signature inside installer: $target ($($signature.Status))"
+            }
+          }
+
+      - name: Upload unsigned installer artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: installer-unsigned-${{ env.DESKTOP_VERSION }}
+          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/${{ env.INSTALLER_PREFIX }}-*-Setup.exe
+          retention-days: 1
+
+  # Sign the Windows installer through the internal Jenkins job. Runs on the
+  # self-hosted sign runner because Jenkins lives on the corporate network and
+  # cloud runners cannot reach it. Uploads the signed exe under the versioned
+  # R2 prefix; updater pointers are published later by `promote`.
+  sign-windows:
+    needs: [package-windows-installer]
+    if: ${{ always() && needs.package-windows-installer.result == 'success' }}
+    runs-on: sign
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          persist-credentials: false
+
+      # The self-hosted sign runner is a bare machine with no preinstalled
+      # toolchain — install Node here (the scripts below run under `node`).
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      # prepare-desktop-update-manifest.mjs imports `yaml`; install just that one
+      # package so the manifest step can run without the whole workspace. The
+      # scripts/ prefix keeps npm away from the caller's workspace manifest.
+      - name: Install manifest dependency
+        shell: bash
+        run: npm install --prefix scripts --no-save --ignore-scripts yaml@2
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Skip on smoke tags
+        if: env.IS_SMOKE_TAG == 'true'
+        shell: bash
+        run: echo "Smoke tag — nothing to sign or publish."
+
+      - name: Download unsigned installer artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: installer-unsigned-${{ env.DESKTOP_VERSION }}
+          path: dist
+
+      - name: Sign installer via Jenkins
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          JENKINS_URL: ${{ secrets.JENKINS_SIGN_URL }}
+          JENKINS_USER: ${{ secrets.JENKINS_SIGN_USER }}
+          JENKINS_TOKEN: ${{ secrets.JENKINS_SIGN_TOKEN }}
+        run: |
+          exe=""
+          for f in dist/*.exe; do
+            [ -f "$f" ] || continue
+            exe="$f"
+            break
+          done
+          if [ -z "$exe" ]; then
+            echo "::error ::No Windows installer exe found to sign"
+            exit 1
+          fi
+          node scripts/sign-windows-via-jenkins.mjs --exe "$exe"
+
+      - name: Verify signed installer Authenticode
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/*.exe | Where-Object { $_.PSIsContainer -eq $false } | Select-Object -First 1
+          if (-not $installer) {
+            Write-Host "::error ::No Windows installer exe found after signing"
+            exit 1
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
+            Write-Host "::error ::Unsigned or invalid Authenticode signature: $($installer.FullName) ($($signature.Status))"
+            exit 1
+          }
+
+      - name: Upload signed installer to R2
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+        run: |
+          installer_path=""
+          for f in dist/*.exe; do
+            [ -f "$f" ] || continue
+            installer_path="$f"
+            break
+          done
+          if [ -z "$installer_path" ]; then
+            echo "::error ::No Windows installer exe found after signing"
+            exit 1
+          fi
+
+          # Upload via a stdlib-only Node SigV4 helper — the bare sign runner has
+          # no aws-cli and can't pip-install one.
+          node scripts/r2-put.mjs \
+            --file "$installer_path" \
+            --bucket "$R2_BUCKET" \
+            --key "$PRODUCT_SLUG/$DESKTOP_VERSION/$(basename "$installer_path")" \
+            --endpoint "$R2_ENDPOINT" \
+            --immutable
+
+          # Regenerate the updater manifest from the SIGNED exe so its sha512 and
+          # size match what clients download. Any manifest electron-builder
+          # emitted before signing is stale.
+          mkdir -p dist
+          manifest_path="dist/latest.yml"
+          node scripts/prepare-desktop-update-manifest.mjs \
+            --generate-from-file "$installer_path" \
+            --manifest "$manifest_path" \
+            --version "$DESKTOP_VERSION"
+
+      - name: Upload Windows manifest artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/upload-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-manifest-${{ env.DESKTOP_VERSION }}
+          path: dist/latest.yml
+          retention-days: 1
+
+  # Publish updater pointers only after both platforms succeeded. Versioned
+  # objects are immutable; these keys move.
+  promote:
+    needs: [publish-macos, sign-windows]
+    if: ${{ always() && needs.publish-macos.result == 'success' && needs.sign-windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve kit source
+        id: kit
+        shell: bash
+        run: |
+          ref="${KIT_WORKFLOW_REF}"
+          repository="${ref%%/.github/*}"
+          if [[ ! "$repository" =~ ^[A-Za-z0-9._-]+/desktop-release-kit$ ]]; then
+            echo "::error ::KIT_WORKFLOW_REF must resolve to <owner>/desktop-release-kit, got: ${repository:-<empty>}"
+            exit 1
+          fi
+          echo "repository=${repository}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref##*@}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6 # TODO: pin to commit SHA before first production use
+        with:
+          repository: ${{ steps.kit.outputs.repository }}
+          ref: ${{ steps.kit.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Setup Node
+        uses: actions/setup-node@v6 # TODO: pin to commit SHA before first production use
+        with:
+          node-version: ${{ inputs['node-version'] }}
+
+      - name: Resolve release metadata
+        shell: bash
+        run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
+
+      - name: Skip on smoke tags
+        if: env.IS_SMOKE_TAG == 'true'
+        shell: bash
+        run: echo "Smoke tag — nothing to promote."
+
+      - name: Download macOS manifest artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: mac-manifest-${{ env.DESKTOP_VERSION }}
+          path: manifests/mac
+
+      - name: Download Windows manifest artifact
+        if: env.IS_SMOKE_TAG != 'true'
+        uses: actions/download-artifact@v6 # TODO: pin to commit SHA before first production use
+        with:
+          name: win-manifest-${{ env.DESKTOP_VERSION }}
+          path: manifests/win
+
+      - name: Publish updater pointers to R2
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+        run: |
+          mac_manifest="$(find manifests/mac -name 'latest-mac.yml' -print -quit)"
+          win_manifest="$(find manifests/win -name 'latest.yml' -print -quit)"
+          if [[ -z "$mac_manifest" || ! -f "$mac_manifest" ]]; then
+            echo "::error ::Missing macOS updater manifest artifact."
+            exit 1
+          fi
+          if [[ -z "$win_manifest" || ! -f "$win_manifest" ]]; then
+            echo "::error ::Missing Windows updater manifest artifact."
+            exit 1
+          fi
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            mac_key="rc-mac.yml"
+            win_key="rc.yml"
+          else
+            mac_key="latest-mac.yml"
+            win_key="latest.yml"
+          fi
+
+          # Stable CAS: read desktop-version.json, refuse existing >= current
+          # (full SemVer, no-prerelease wins), then write pointers. Prerelease
+          # only writes rc*.yml and must not touch stable keys.
+          if [ "$IS_PRERELEASE" != "true" ]; then
+            existing="$(mktemp)"
+            set +e
+            err="$(node scripts/s3-get.mjs \
+              --bucket "$R2_BUCKET" \
+              --key "$PRODUCT_SLUG/desktop-version.json" \
+              --endpoint "$R2_ENDPOINT" \
+              --output "$existing" 2>&1)"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              if [[ "$err" == *"HTTP 404"* ]]; then
+                echo "No existing desktop-version.json — first stable publish."
+              else
+                echo "::error ::Failed to read existing desktop-version.json"
+                echo "$err"
+                exit 1
+              fi
+            else
+              EXISTING_VERSION_FILE="$existing" node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { compareReleaseVersions, parseReleaseVersion } from "./scripts/release-version-utils.mjs";
+
+          const existingPath = process.env.EXISTING_VERSION_FILE;
+          const current = process.env.DESKTOP_VERSION;
+          const existing = JSON.parse(readFileSync(existingPath, "utf8"));
+          if (typeof existing?.version !== "string") {
+            console.error("::error ::desktop-version.json is missing a version string");
+            process.exit(1);
+          }
+          parseReleaseVersion(existing.version);
+          parseReleaseVersion(current);
+          if (compareReleaseVersions(existing.version, current) >= 0) {
+            console.error(`::error ::Refusing to move stable pointer from ${existing.version} to ${current} (existing >= current)`);
+            process.exit(1);
+          }
+          NODE
+            fi
+          fi
+
+          node scripts/r2-put.mjs \
+            --file "$mac_manifest" \
+            --bucket "$R2_BUCKET" \
+            --key "$PRODUCT_SLUG/$mac_key" \
+            --endpoint "$R2_ENDPOINT"
+          node scripts/r2-put.mjs \
+            --file "$win_manifest" \
+            --bucket "$R2_BUCKET" \
+            --key "$PRODUCT_SLUG/$win_key" \
+            --endpoint "$R2_ENDPOINT"
+
+          # Prerelease must not move stable pointers (desktop-version.json / latest*).
+          if [ "$IS_PRERELEASE" != "true" ]; then
+            printf '{"version":"%s"}\n' "$DESKTOP_VERSION" > desktop-version.json
+            node scripts/r2-put.mjs \
+              --file desktop-version.json \
+              --bucket "$R2_BUCKET" \
+              --key "$PRODUCT_SLUG/desktop-version.json" \
+              --endpoint "$R2_ENDPOINT"
+          fi
+
+      - name: Verify feed
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        run: |
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            pointer="rc.yml"
+          else
+            pointer="latest.yml"
+          fi
+          url="${DOWNLOADS_BASE%/}/$PRODUCT_SLUG/$pointer"
+          if ! curl -fsS "$url" > /dev/null; then
+            echo "::warning ::CDN feed not yet readable at $url (cache may lag)"
+          fi
+
+      # Reading the manifest is not proof the artifacts behind it are reachable: a
+      # CDN can answer HEAD from bucket metadata while GET falls through to an SPA
+      # rewrite, so clients download an HTML page instead of the installer. Stream
+      # real bytes from every entry and check what comes back.
+      - name: Verify published artifacts are downloadable
+        if: env.IS_SMOKE_TAG != 'true'
+        shell: bash
+        env:
+          NODE_PATH: ${{ github.workspace }}/scripts/node_modules
+        run: |
+          base="${DOWNLOADS_BASE%/}/$PRODUCT_SLUG"
+          for manifest in $(find manifests -name '*.yml' -print); do
+            echo "checking $manifest against $base"
+            node scripts/verify-published-artifacts.mjs \
+              --manifest "$manifest" \
+              --base "$base" \
+              --max-bytes "${{ inputs['verify-published-bytes'] }}"
+          done
+
+  # GITHUB_TOKEN-created releases don't fire the `release: published` event.
+  # Leave a job skeleton so a future website/index update can be dispatched.
+  trigger-deploy-website:
+    needs: [promote]
+    if: ${{ always() && needs.promote.result == 'success' && github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.') }}
+    permissions:
+      actions: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Website deploy pending
+        run: echo "Stable desktop release published; dispatch a downstream website deploy here."
