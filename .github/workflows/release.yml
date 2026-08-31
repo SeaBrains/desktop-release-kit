@@ -812,18 +812,20 @@ jobs:
           fi
           node scripts/sign-windows-via-jenkins.mjs --exe "${installers[0]}"
 
-      - name: Verify signed installer Authenticode
-        shell: pwsh
+      # The sign runner is a bare macOS box: no pwsh, no Get-AuthenticodeSignature.
+      # Check the PE optional header's certificate table instead — it catches the
+      # failure mode where Jenkins returns bytes it never signed. Full chain
+      # validation already happened on the Windows packaging job for payload exes.
+      - name: Verify signed installer has a certificate table
+        shell: bash
         run: |
-          $pattern = "dist/${env:INSTALLER_PREFIX}-${env:DESKTOP_VERSION}-*-Setup.exe"
-          $installers = @(Get-ChildItem $pattern -ErrorAction SilentlyContinue)
-          if ($installers.Count -ne 1) { throw "Expected exactly one installer matching $pattern, found $($installers.Count)" }
-          $installer = $installers[0]
-          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
-          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
-            Write-Host "::error ::Unsigned or invalid Authenticode signature: $($installer.FullName) ($($signature.Status))"
+          installers=(dist/${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe)
+          if [ ${#installers[@]} -ne 1 ] || [ ! -f "${installers[0]}" ]; then
+            echo "::error ::Expected exactly one installer matching ${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe"
+            ls dist/ || true
             exit 1
-          }
+          fi
+          node scripts/assert-pe-signed.mjs "${installers[0]}"
 
       - name: Upload signed installer to R2
         shell: bash
