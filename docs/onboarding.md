@@ -100,6 +100,7 @@ jobs:
       installer-prefix: DSH-Desktop
       executable-name: SeaHarness.exe
       r2-bucket: seaharness-downloads
+      r2-endpoint: https://<account-id>.r2.cloudflarestorage.com
       downloads-base: https://downloads.seaharness.ai
       # 有 vendored submodule 时填，pin 不一致会在打包前失败（省掉 ~20 分钟公证）
       upstream-manifest: upstream.json
@@ -136,9 +137,7 @@ gh api orgs/<org> -q '.plan.name'   # free → 必须 repo 级；team/enterprise
 
 失败特征：日志里 `CSC_LINK:` 后面是**空的**（而不是报值错误），签名步骤 2 秒内挂在 `A valid Developer ID Application certificate ... is required`。
 
-Caller 的 `GITHUB_TOKEN` 需能读取本 kit（公开仓库，或同 org 允许访问 private repo）。R2 走 org Cloudflare 账户 endpoint。
-
-**产品 repo 必须与 kit 同 org（SeaBrains）。** kit 是 private reusable workflow，GitHub 规定 private reusable workflow 只能被同 org 的仓库 `uses:`，跨 org 直接 404，token 绕不过。所有客户端 repo 都放 SeaBrains 下。
+**本 kit 是 public 仓库**——不是疏忽，是必要条件：kit 的每个 job 都要 checkout 自己的 scripts，而 caller 的 `GITHUB_TOKEN` 只对 caller 仓库有权限，private kit 的 checkout 必 404（同 org 也一样，Actions 的 Access 策略只放行 workflow 解析，不放行 git clone）。仓库内不含任何秘密：秘密全部走 caller 的 repo secrets，R2 account id 走 `r2-endpoint` input。禁止向本仓库提交任何 endpoint、内网地址、token。
 
 ## 4. Self-hosted `sign` runner
 

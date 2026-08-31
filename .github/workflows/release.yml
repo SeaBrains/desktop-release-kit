@@ -67,6 +67,10 @@ on:
         required: false
         type: string
         default: ""
+      r2-endpoint:
+        description: "R2 S3 endpoint (https://<account-id>.r2.cloudflarestorage.com). The account id stays out of the kit source."
+        required: true
+        type: string
       updater-contract-mode:
         description: "How to verify the macOS updater handoff contract. 'app-root' scans the packaged .app's asar.unpacked; 'lib-root' reads the compiled shell sources (updater.js + main.js) — for products that keep runtime JS inside app.asar with no asarUnpack."
         required: false
@@ -108,7 +112,7 @@ env:
   INSTALLER_PREFIX: ${{ inputs['installer-prefix'] }}
   RELEASE_EXECUTABLE_NAME: ${{ inputs['executable-name'] }}
   R2_BUCKET: ${{ inputs['r2-bucket'] }}
-  R2_ENDPOINT: https://75615ad798eee20d0c0fa5cfb354ced6.r2.cloudflarestorage.com
+  R2_ENDPOINT: ${{ inputs['r2-endpoint'] }}
   DOWNLOADS_BASE: ${{ inputs['downloads-base'] }}
   RELEASE_TAG_PREFIX: ${{ inputs['tag-prefix'] }}
   # job_workflow_ref is the called kit workflow (owner/kit/.github/workflows/release.yml@ref)
