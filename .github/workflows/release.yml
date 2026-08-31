@@ -47,6 +47,21 @@ on:
         required: false
         type: number
         default: 2000000
+      install-command:
+        description: "Command to install JS dependencies (yarn install --immutable, pnpm install --frozen-lockfile, npm ci)."
+        required: false
+        type: string
+        default: "yarn install --immutable"
+      build-command:
+        description: "Root command to build workspace dependencies."
+        required: false
+        type: string
+        default: "yarn build"
+      workspace-run-prefix:
+        description: "Prefix to run a workspace script, e.g. 'yarn workspace' or 'pnpm --filter'."
+        required: false
+        type: string
+        default: "yarn workspace"
     secrets:
       APPLE_CERTIFICATE:
         required: true
@@ -90,6 +105,9 @@ env:
   # Never fall back to github.workflow_ref (the caller) — that would checkout
   # the product repo on sign runners.
   KIT_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+  INSTALL_COMMAND: ${{ inputs['install-command'] }}
+  BUILD_COMMAND: ${{ inputs['build-command'] }}
+  WORKSPACE_RUN_PREFIX: ${{ inputs['workspace-run-prefix'] }}
 
 jobs:
   create-release:
@@ -104,9 +122,9 @@ jobs:
           fail() { echo "::error ::$*"; exit 1; }
           [[ "$PRODUCT_SLUG" =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || fail "product-slug must match ^[a-z0-9][a-z0-9-]{1,40}$"
           [[ "$R2_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,62}$ ]] || fail "r2-bucket must match ^[a-z0-9][a-z0-9.-]{1,62}$"
-          name_ok() { [[ "$1" =~ ^[^/\\$\`\"\'[:space:]]+$ ]]; }
-          name_ok "$INSTALLER_PREFIX" || fail "installer-prefix must not contain / \\ \$ \` \" ' or whitespace"
-          name_ok "$RELEASE_EXECUTABLE_NAME" || fail "executable-name must not contain / \\ \$ \` \" ' or whitespace"
+          name_ok() { [[ "$1" =~ ^[^/\\$\`\"\'[:space:]]+$ ]] && [[ "$1" != *[*?[]* ]]; }
+          name_ok "$INSTALLER_PREFIX" || fail "installer-prefix must not contain / \\ \$ \` \" ' whitespace or glob metacharacters (* ? [)"
+          name_ok "$RELEASE_EXECUTABLE_NAME" || fail "executable-name must not contain / \\ \$ \` \" ' whitespace or glob metacharacters (* ? [)"
 
       - name: Resolve kit source
         id: kit
@@ -138,7 +156,6 @@ jobs:
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
       - name: Create GitHub release
-        if: env.IS_SMOKE_TAG != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -169,6 +186,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
           # Product repos that vendor an upstream checkout (e.g. a git submodule)
           # need it present for layout/release gates. Caller owns the pin.
@@ -217,7 +235,7 @@ jobs:
         run: corepack enable
 
       - name: Install JS dependencies
-        run: yarn install --immutable
+        run: ${{ env.INSTALL_COMMAND }}
 
       - name: Set desktop package version from tag
         shell: bash
@@ -242,7 +260,7 @@ jobs:
           NODE
 
       - name: Build workspace dependencies
-        run: yarn build
+        run: ${{ env.BUILD_COMMAND }}
 
       - name: Build signed and notarized macOS DMG
         shell: bash
@@ -267,7 +285,7 @@ jobs:
           sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=262144
           ulimit -n 262144
           ulimit -n
-          yarn workspace "$DESKTOP_WORKSPACE" dist:mac
+          ${{ env.WORKSPACE_RUN_PREFIX }} "$DESKTOP_WORKSPACE" dist:mac
 
       # A correctly signed, notarized build can still ship an update that never
       # installs, and nothing downstream would notice: the pipeline goes green and
@@ -283,8 +301,59 @@ jobs:
           fi
           node .release-kit/scripts/verify-updater-contract.mjs --app-root "$app"
 
+      # A green package + upload can still name artifacts that do not exist:
+      # electron-builder sanitizes productName into the manifest filename, so an
+      # implicit artifactName yields url entries no object store will ever hold.
+      # Verify every manifest entry verbatim against disk before anything ships.
+      - name: Verify release artifacts (manifest ↔ disk)
+        shell: bash
+        run: |
+          dist="$DESKTOP_PACKAGE_PATH/dist/mac-release"
+          version="$DESKTOP_VERSION"
+
+          # electron-builder names the manifest after the channel it derives
+          # from the version (latest-mac.yml stable, rc-mac.yml for -rc.N).
+          # Normalize to latest-mac.yml here; promote alone decides which
+          # pointer key (latest-mac.yml vs rc-mac.yml) the content lands on.
+          case "$version" in
+            *-*) pre="${version#*-}"; channel="${pre%%.*}";;
+            *)   channel="latest";;
+          esac
+          manifest_name="${channel}-mac.yml"
+          [ -f "$dist/$manifest_name" ] || { echo "::error ::$manifest_name missing under $dist"; ls "$dist"; exit 1; }
+          if [ "$manifest_name" != "latest-mac.yml" ]; then
+            cp "$dist/$manifest_name" "$dist/latest-mac.yml"
+          fi
+
+          node --input-type=module <<'NODE'
+          import { existsSync, readFileSync } from 'node:fs'
+          import { join } from 'node:path'
+
+          const dist = join(process.env.DESKTOP_PACKAGE_PATH, 'dist', 'mac-release')
+          const manifest = readFileSync(join(dist, 'latest-mac.yml'), 'utf8')
+          const version = process.env.DESKTOP_VERSION
+
+          const manifestVersion = /^version:\s*(.+)$/m.exec(manifest)?.[1].trim()
+          if (manifestVersion !== version) {
+            console.error(`::error ::latest-mac.yml version ${manifestVersion} does not match tag version ${version}`)
+            process.exit(1)
+          }
+
+          // Every `url:` under files[] must name a file that exists verbatim.
+          const urls = [...manifest.matchAll(/^\s*-?\s*url:\s*(.+)$/gm)].map(m => m[1].trim())
+          if (urls.length === 0) {
+            console.error('::error ::latest-mac.yml lists no file urls')
+            process.exit(1)
+          }
+          const missing = urls.filter(url => !existsSync(join(dist, url)))
+          if (missing.length > 0) {
+            for (const url of missing) console.error(`::error ::latest-mac.yml points at a missing file: ${url}`)
+            process.exit(1)
+          }
+          console.log(`verify-release-artifacts: ${urls.length} manifest entr(ies) match files on disk`)
+          NODE
+
       - name: Upload to R2
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
@@ -309,12 +378,10 @@ jobs:
           done
 
       - name: Install manifest dependency
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
-        run: npm install --prefix .release-kit/scripts --no-save --no-package-lock yaml@2
+        run: npm install --prefix .release-kit/scripts --no-save --no-package-lock --ignore-scripts yaml@2
 
       - name: Prepare macOS auto-updater manifest
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -336,7 +403,6 @@ jobs:
             --version "$DESKTOP_VERSION"
 
       - name: Upload macOS manifest artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: mac-manifest-${{ env.DESKTOP_VERSION }}
@@ -355,6 +421,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Resolve kit source
@@ -391,7 +458,7 @@ jobs:
         run: corepack enable
 
       - name: Install JS dependencies
-        run: yarn install --immutable
+        run: ${{ env.INSTALL_COMMAND }}
 
       - name: Set desktop package version from tag
         shell: bash
@@ -416,16 +483,15 @@ jobs:
           NODE
 
       - name: Build workspace dependencies
-        run: yarn build
+        run: ${{ env.BUILD_COMMAND }}
 
       - name: Build unsigned Windows win-unpacked directory
         shell: bash
-        run: yarn workspace "$DESKTOP_WORKSPACE" dist:win-unpacked
+        run: ${{ env.WORKSPACE_RUN_PREFIX }} "$DESKTOP_WORKSPACE" dist:win-unpacked
 
       # The unsigned app travels to the signing stage via a run-scoped artifact:
       # private, no extra credentials on the self-hosted sign runner.
       - name: Upload unsigned app artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-unpacked-${{ env.DESKTOP_VERSION }}
@@ -472,14 +538,12 @@ jobs:
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
       - name: Download unsigned app artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-unpacked-${{ env.DESKTOP_VERSION }}
           path: win-unpacked
 
       - name: Sign app executables via Jenkins
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           JENKINS_URL: ${{ secrets.JENKINS_SIGN_URL }}
@@ -488,12 +552,12 @@ jobs:
         run: |
           app_root="win-unpacked"
           node scripts/list-windows-signing-targets.mjs --root "$app_root" > signing-targets.txt
+          [ -s signing-targets.txt ] || { echo "::error ::No Windows signing targets resolved under $app_root."; exit 1; }
           while IFS= read -r exe; do
             node scripts/sign-windows-via-jenkins.mjs --exe "$exe"
           done < signing-targets.txt
 
       - name: Upload signed app artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
@@ -514,6 +578,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - name: Resolve kit source
@@ -550,7 +615,7 @@ jobs:
         run: corepack enable
 
       - name: Install JS dependencies
-        run: yarn install --immutable
+        run: ${{ env.INSTALL_COMMAND }}
 
       - name: Set desktop package version from tag
         shell: bash
@@ -575,19 +640,18 @@ jobs:
           NODE
 
       - name: Download signed app artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked
 
       - name: Verify signed app executables
-        if: env.IS_SMOKE_TAG != 'true'
         shell: pwsh
         run: |
           $appRoot = Join-Path $env:DESKTOP_PACKAGE_PATH 'dist/win-unpacked'
           $targets = @(node .release-kit/scripts/list-windows-signing-targets.mjs --root $appRoot)
           if ($LASTEXITCODE -ne 0) { throw 'Could not resolve Windows signing targets.' }
+          if ($targets.Count -lt 1) { throw 'Signing target list is empty at verification.' }
           foreach ($target in $targets) {
             $signature = Get-AuthenticodeSignature -LiteralPath $target
             if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
@@ -596,12 +660,22 @@ jobs:
           }
 
       - name: Package signed app as NSIS installer
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
-        run: yarn workspace "$DESKTOP_WORKSPACE" dist:win-installer
+        run: |
+          ${{ env.WORKSPACE_RUN_PREFIX }} "$DESKTOP_WORKSPACE" dist:win-installer
+          # Same channel normalization as macOS: electron-builder writes rc.yml
+          # for -rc.N versions; downstream always reads latest.yml.
+          case "$DESKTOP_VERSION" in
+            *-*) pre="${DESKTOP_VERSION#*-}"; channel="${pre%%.*}";;
+            *)   channel="latest";;
+          esac
+          dist="$DESKTOP_PACKAGE_PATH/dist"
+          [ -f "$dist/${channel}.yml" ] || { echo "::error ::${channel}.yml missing under $dist"; ls "$dist"; exit 1; }
+          if [ "$channel" != "latest" ]; then
+            cp "$dist/${channel}.yml" "$dist/latest.yml"
+          fi
 
       - name: Verify signed payload inside installer
-        if: env.IS_SMOKE_TAG != 'true'
         shell: pwsh
         run: |
           # electron-builder rewrites payload files during NSIS packing (it
@@ -609,8 +683,10 @@ jobs:
           # The pre-pack verification above cannot see that, so re-verify the
           # bytes actually shipped inside the installer. NSIS nests the app
           # files in $PLUGINSDIR/app-64.7z — extract two levels.
-          $installer = Get-ChildItem "$env:DESKTOP_PACKAGE_PATH/dist/${env:INSTALLER_PREFIX}-*-Setup.exe" | Select-Object -First 1
-          if (-not $installer) { throw 'No installer exe found to verify' }
+          $pattern = "$env:DESKTOP_PACKAGE_PATH/dist/${env:INSTALLER_PREFIX}-${env:DESKTOP_VERSION}-*-Setup.exe"
+          $installers = @(Get-ChildItem $pattern -ErrorAction SilentlyContinue)
+          if ($installers.Count -ne 1) { throw "Expected exactly one installer matching $pattern, found $($installers.Count)" }
+          $installer = $installers[0]
           $outer = Join-Path $env:RUNNER_TEMP 'installer-outer'
           & 7z x $installer.FullName "-o$outer" -y | Out-Null
           if ($LASTEXITCODE -ne 0) { throw '7z extraction of installer failed' }
@@ -633,11 +709,12 @@ jobs:
           }
 
       - name: Upload unsigned installer artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: installer-unsigned-${{ env.DESKTOP_VERSION }}
-          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/${{ env.INSTALLER_PREFIX }}-*-Setup.exe
+          path: |
+            ${{ env.DESKTOP_PACKAGE_PATH }}/dist/${{ env.INSTALLER_PREFIX }}-*-Setup.exe
+            ${{ env.DESKTOP_PACKAGE_PATH }}/dist/latest.yml
           retention-days: 1
 
   # Sign the Windows installer through the internal Jenkins job. Runs on the
@@ -677,9 +754,9 @@ jobs:
         with:
           node-version: ${{ inputs['node-version'] }}
 
-      # prepare-desktop-update-manifest.mjs imports `yaml`; install just that one
-      # package so the manifest step can run without the whole workspace. The
-      # scripts/ prefix keeps npm away from the caller's workspace manifest.
+      # The manifest rewrite step below parses electron-builder's latest.yml with
+      # `yaml`; install just that one package so it runs without the whole
+      # workspace. The scripts/ prefix keeps npm away from the caller's manifest.
       - name: Install manifest dependency
         shell: bash
         run: npm install --prefix scripts --no-save --ignore-scripts yaml@2
@@ -688,47 +765,36 @@ jobs:
         shell: bash
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
-      - name: Skip on smoke tags
-        if: env.IS_SMOKE_TAG == 'true'
-        shell: bash
-        run: echo "Smoke tag — nothing to sign or publish."
-
       - name: Download unsigned installer artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: installer-unsigned-${{ env.DESKTOP_VERSION }}
           path: dist
 
       - name: Sign installer via Jenkins
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           JENKINS_URL: ${{ secrets.JENKINS_SIGN_URL }}
           JENKINS_USER: ${{ secrets.JENKINS_SIGN_USER }}
           JENKINS_TOKEN: ${{ secrets.JENKINS_SIGN_TOKEN }}
         run: |
-          exe=""
-          for f in dist/*.exe; do
-            [ -f "$f" ] || continue
-            exe="$f"
-            break
-          done
-          if [ -z "$exe" ]; then
-            echo "::error ::No Windows installer exe found to sign"
+          # Exact version binding: never "first exe in the directory". The
+          # sign/verify/upload steps must all target the same file.
+          installers=(dist/${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe)
+          if [ ${#installers[@]} -ne 1 ] || [ ! -f "${installers[0]}" ]; then
+            echo "::error ::Expected exactly one installer matching ${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe"
+            ls dist/ || true
             exit 1
           fi
-          node scripts/sign-windows-via-jenkins.mjs --exe "$exe"
+          node scripts/sign-windows-via-jenkins.mjs --exe "${installers[0]}"
 
       - name: Verify signed installer Authenticode
-        if: env.IS_SMOKE_TAG != 'true'
         shell: pwsh
         run: |
-          $installer = Get-ChildItem dist/*.exe | Where-Object { $_.PSIsContainer -eq $false } | Select-Object -First 1
-          if (-not $installer) {
-            Write-Host "::error ::No Windows installer exe found after signing"
-            exit 1
-          }
+          $pattern = "dist/${env:INSTALLER_PREFIX}-${env:DESKTOP_VERSION}-*-Setup.exe"
+          $installers = @(Get-ChildItem $pattern -ErrorAction SilentlyContinue)
+          if ($installers.Count -ne 1) { throw "Expected exactly one installer matching $pattern, found $($installers.Count)" }
+          $installer = $installers[0]
           $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
           if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
             Write-Host "::error ::Unsigned or invalid Authenticode signature: $($installer.FullName) ($($signature.Status))"
@@ -736,22 +802,18 @@ jobs:
           }
 
       - name: Upload signed installer to R2
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
         run: |
-          installer_path=""
-          for f in dist/*.exe; do
-            [ -f "$f" ] || continue
-            installer_path="$f"
-            break
-          done
-          if [ -z "$installer_path" ]; then
-            echo "::error ::No Windows installer exe found after signing"
+          installers=(dist/${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe)
+          if [ ${#installers[@]} -ne 1 ] || [ ! -f "${installers[0]}" ]; then
+            echo "::error ::Expected exactly one signed installer matching ${INSTALLER_PREFIX}-${DESKTOP_VERSION}-*-Setup.exe"
+            ls dist/ || true
             exit 1
           fi
+          installer_path="${installers[0]}"
 
           # Upload via a stdlib-only Node SigV4 helper — the bare sign runner has
           # no aws-cli and can't pip-install one.
@@ -762,18 +824,70 @@ jobs:
             --endpoint "$R2_ENDPOINT" \
             --immutable
 
-          # Regenerate the updater manifest from the SIGNED exe so its sha512 and
-          # size match what clients download. Any manifest electron-builder
-          # emitted before signing is stale.
-          mkdir -p dist
-          manifest_path="dist/latest.yml"
-          node scripts/prepare-desktop-update-manifest.mjs \
-            --generate-from-file "$installer_path" \
-            --manifest "$manifest_path" \
-            --version "$DESKTOP_VERSION"
+          # electron-builder's own latest.yml (shipped alongside the installer
+          # artifact) predates signing, so its sha512/size are stale. Parse and
+          # rewrite it structurally: prefix every relative url/path — including
+          # the NSIS differential-update `packages` entries — with the version
+          # dir, and refresh hash/size only on the entry that names the signed
+          # installer (packages entries keep electron-builder's own values).
+          INSTALLER="$installer_path" VERSION="$DESKTOP_VERSION" NODE_PATH="$PWD/scripts/node_modules" node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { readFileSync, statSync, writeFileSync } from 'node:fs'
+          import { basename } from 'node:path'
+          import { parse, stringify } from 'yaml'
+
+          const installer = process.env.INSTALLER
+          const version = process.env.VERSION
+          const name = basename(installer)
+          const sha512 = createHash('sha512').update(readFileSync(installer)).digest('base64')
+          const size = statSync(installer).size
+
+          const manifestPath = 'dist/latest.yml'
+          const manifest = parse(readFileSync(manifestPath, 'utf8'))
+
+          if (manifest.version !== version) {
+            console.error(`::error ::latest.yml version ${manifest.version} != ${version}`)
+            process.exit(1)
+          }
+
+          // Prefix every relative url/path with the version directory.
+          const prefixIfRelative = (value) => (typeof value === 'string' && !value.includes('/') ? `${version}/${value}` : value)
+          for (const entry of manifest.files ?? []) {
+            if (entry && typeof entry === 'object') {
+              if (typeof entry.url === 'string') entry.url = prefixIfRelative(entry.url)
+              if (typeof entry.path === 'string') entry.path = prefixIfRelative(entry.path)
+            }
+          }
+          if (typeof manifest.path === 'string') manifest.path = prefixIfRelative(manifest.path)
+          if (manifest.packages && typeof manifest.packages === 'object') {
+            for (const pkg of Object.values(manifest.packages)) {
+              if (pkg && typeof pkg === 'object' && typeof pkg.path === 'string') pkg.path = prefixIfRelative(pkg.path)
+            }
+          }
+
+          // Refresh hash/size only on entries that describe the signed installer.
+          let touched = 0
+          for (const entry of manifest.files ?? []) {
+            if (entry && typeof entry === 'object' && typeof entry.url === 'string' && entry.url.split('/').pop() === name) {
+              entry.sha512 = sha512
+              entry.size = size
+              touched += 1
+            }
+          }
+          if (typeof manifest.path === 'string' && manifest.path.split('/').pop() === name) {
+            manifest.sha512 = sha512
+            manifest.size = size
+          }
+          if (touched === 0) {
+            console.error(`::error ::latest.yml has no files entry for ${name}`)
+            process.exit(1)
+          }
+
+          writeFileSync(manifestPath, stringify(manifest))
+          console.log(`latest.yml rewritten for signed ${name} (${size} bytes)`)
+          NODE
 
       - name: Upload Windows manifest artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: win-manifest-${{ env.DESKTOP_VERSION }}
@@ -818,27 +932,25 @@ jobs:
         shell: bash
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
-      - name: Skip on smoke tags
-        if: env.IS_SMOKE_TAG == 'true'
+      # verify-published-artifacts.mjs imports `yaml`; install just that one
+      # package so the download check runs without the whole workspace.
+      - name: Install manifest dependency
         shell: bash
-        run: echo "Smoke tag — nothing to promote."
+        run: npm install --prefix scripts --no-save --ignore-scripts yaml@2
 
       - name: Download macOS manifest artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: mac-manifest-${{ env.DESKTOP_VERSION }}
           path: manifests/mac
 
       - name: Download Windows manifest artifact
-        if: env.IS_SMOKE_TAG != 'true'
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: win-manifest-${{ env.DESKTOP_VERSION }}
           path: manifests/win
 
       - name: Publish updater pointers to R2
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
@@ -927,26 +1039,41 @@ jobs:
               --endpoint "$R2_ENDPOINT"
           fi
 
-      - name: Verify feed
-        if: env.IS_SMOKE_TAG != 'true'
+      # The one assertion that re-establishes "green run == published release":
+      # read the pointer back through the S3 API and require that it names this
+      # exact version. Whatever silently skipped upstream, a stale pointer here
+      # is a red run.
+      - name: Verify promoted pointer (read-back)
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
         run: |
           if [ "$IS_PRERELEASE" = "true" ]; then
-            pointer="rc.yml"
+            keys="rc-mac.yml rc.yml"
           else
-            pointer="latest.yml"
+            keys="latest-mac.yml latest.yml"
           fi
-          url="${DOWNLOADS_BASE%/}/$PRODUCT_SLUG/$pointer"
-          if ! curl -fsS "$url" > /dev/null; then
-            echo "::warning ::CDN feed not yet readable at $url (cache may lag)"
-          fi
+          for key in $keys; do
+            readback="$(mktemp)"
+            node scripts/s3-get.mjs \
+              --bucket "$R2_BUCKET" \
+              --key "$PRODUCT_SLUG/$key" \
+              --endpoint "$R2_ENDPOINT" \
+              --output "$readback"
+            published="$(sed -n 's/^version:[[:space:]]*//p' "$readback" | head -1)"
+            if [ "$published" != "$DESKTOP_VERSION" ]; then
+              echo "::error ::Promoted pointer $key reads back version '$published', expected '$DESKTOP_VERSION'"
+              exit 1
+            fi
+            echo "Pointer $key confirms $published"
+          done
 
       # Reading the manifest is not proof the artifacts behind it are reachable: a
       # CDN can answer HEAD from bucket metadata while GET falls through to an SPA
       # rewrite, so clients download an HTML page instead of the installer. Stream
       # real bytes from every entry and check what comes back.
       - name: Verify published artifacts are downloadable
-        if: env.IS_SMOKE_TAG != 'true'
         shell: bash
         env:
           NODE_PATH: ${{ github.workspace }}/scripts/node_modules
@@ -959,15 +1086,3 @@ jobs:
               --base "$base" \
               --max-bytes "${{ inputs['verify-published-bytes'] }}"
           done
-
-  # GITHUB_TOKEN-created releases don't fire the `release: published` event.
-  # Leave a job skeleton so a future website/index update can be dispatched.
-  trigger-deploy-website:
-    needs: [promote]
-    if: ${{ always() && needs.promote.result == 'success' && github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.') }}
-    permissions:
-      actions: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Website deploy pending
-        run: echo "Stable desktop release published; dispatch a downstream website deploy here."

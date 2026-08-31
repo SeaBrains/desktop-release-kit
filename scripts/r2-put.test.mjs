@@ -150,3 +150,28 @@ test("r2-put --immutable fails 412 when existing content differs", async () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /already exists/);
 });
+
+test("r2-put rejects keys with traversal or unsafe segments", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "r2-put-"));
+  const file = join(dir, "payload.bin");
+  await writeFile(file, "hello");
+  try {
+    for (const key of ["../../etc/passwd", "/absolute/path", "a/../b", "has space", ".."]) {
+      const result = await runPut([
+        script,
+        "--file",
+        file,
+        "--bucket",
+        "bucket",
+        "--key",
+        key,
+        "--endpoint",
+        "http://127.0.0.1:1",
+      ]);
+      assert.equal(result.status, 1, `key ${JSON.stringify(key)} must be rejected`);
+      assert.match(result.stderr, /unsafe segments/);
+    }
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});

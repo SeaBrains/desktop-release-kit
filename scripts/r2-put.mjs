@@ -31,6 +31,12 @@ function parseArgs(argv) {
   for (const k of ["file", "bucket", "key", "endpoint"]) {
     if (!out[k]) throw new Error(`--${k} is required`);
   }
+  // One gate for every call site: keys are slash-joined plain segments, never
+  // traversal or an absolute path. A caller-controlled slug that reached here
+  // otherwise addresses arbitrary keys in any same-account bucket.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(out.key) || out.key.includes("..")) {
+    throw new Error(`--key has unsafe segments: ${out.key}`);
+  }
   return out;
 }
 

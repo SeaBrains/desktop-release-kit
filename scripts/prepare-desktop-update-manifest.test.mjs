@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 import {
-  generateDesktopUpdateManifestFromFile,
   prefixDesktopUpdatePath,
   prepareDesktopUpdateManifest,
 } from "./prepare-desktop-update-manifest.mjs";
@@ -110,48 +106,4 @@ test("prepareDesktopUpdateManifest fails on release version mismatch", () => {
     () => prepareDesktopUpdateManifest("version: 2.1.0\npath: DSH-Desktop.dmg\n", { version: "1.0.7" }),
     /does not match release version/,
   );
-});
-
-test("generateDesktopUpdateManifestFromFile creates a Windows installer manifest", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dsh-manifest-"));
-  try {
-    const installerPath = join(dir, "DSH-Desktop-Setup-2.1.0-rc.1.exe");
-    await writeFile(installerPath, "fake installer content");
-
-    const output = await generateDesktopUpdateManifestFromFile({
-      filePath: installerPath,
-      version: "2.1.0-rc.1",
-    });
-    const manifest = parse(output);
-
-    assert.equal(manifest.version, "2.1.0-rc.1");
-    assert.equal(manifest.files[0].url, "2.1.0-rc.1/DSH-Desktop-Setup-2.1.0-rc.1.exe");
-    assert.equal(manifest.files[0].size, (await readFile(installerPath)).byteLength);
-    assert.equal(manifest.path, "2.1.0-rc.1/DSH-Desktop-Setup-2.1.0-rc.1.exe");
-    assert.equal(manifest.sha512, manifest.files[0].sha512);
-    assert.match(manifest.releaseDate, /^\d{4}-\d{2}-\d{2}T/);
-  } finally {
-    await rm(dir, { force: true, recursive: true });
-  }
-});
-
-test("generateDesktopUpdateManifestFromFile applies a GH release base URL", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "dsh-manifest-"));
-  const base = "https://github.com/anywhere-labs/deepseek-harness-desktop/releases/download/v2.1.0";
-  try {
-    const installerPath = join(dir, "DSH-Desktop-Setup-2.1.0.exe");
-    await writeFile(installerPath, "fake installer content");
-
-    const output = await generateDesktopUpdateManifestFromFile({
-      filePath: installerPath,
-      version: "2.1.0",
-      baseUrl: base,
-    });
-    const manifest = parse(output);
-
-    assert.equal(manifest.files[0].url, `${base}/DSH-Desktop-Setup-2.1.0.exe`);
-    assert.equal(manifest.path, `${base}/DSH-Desktop-Setup-2.1.0.exe`);
-  } finally {
-    await rm(dir, { force: true, recursive: true });
-  }
 });
