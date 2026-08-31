@@ -103,3 +103,66 @@ test('fails when no product chunk calls the updater at all', () => {
   assert.match(output, /no product chunk calling autoUpdater\.quitAndInstall/u)
   rmSync(root, { recursive: true, force: true })
 })
+
+// --- --lib-root mode (compiled shell sources) ---
+
+function libWith(updaterSource, mainSource) {
+  const root = mkdtempSync(join(tmpdir(), 'updater-lib-'))
+  writeFileSync(join(root, 'updater.js'), updaterSource)
+  writeFileSync(join(root, 'main.js'), mainSource)
+  return root
+}
+
+function runLib(root) {
+  try {
+    execFileSync(process.execPath, [script, '--lib-root', root], { encoding: 'utf8', stdio: 'pipe' })
+    return { code: 0, output: '' }
+  } catch (error) {
+    return { code: error.status, output: `${error.stdout ?? ''}${error.stderr ?? ''}` }
+  }
+}
+
+const LIB_UPDATER = `
+  autoUpdater.autoInstallOnAppQuit = false;
+  beginShutdown(() => {
+    autoUpdater.quitAndInstall(false, true);
+  });
+`
+const LIB_MAIN = `
+  app.on('before-quit', (e) => { if (disposing) return; e.preventDefault(); requestShutdown(() => onDisposed()); });
+  function onDisposed() {}
+`
+
+test('lib-root accepts compliant updater.js + main.js', () => {
+  const root = libWith(LIB_UPDATER, LIB_MAIN)
+  assert.equal(runLib(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('lib-root rejects a bare quitAndInstall outside the handoff', () => {
+  const root = libWith(
+    'autoUpdater.autoInstallOnAppQuit = false;\nautoUpdater.quitAndInstall(false, true);',
+    LIB_MAIN,
+  )
+  const { code, output } = runLib(root)
+  assert.equal(code, 1)
+  assert.match(output, /quitAndInstall is not wrapped in the beginShutdown handoff/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('lib-root rejects main.js without a disposing pass-through', () => {
+  const root = libWith(LIB_UPDATER, "app.on('quit', () => process.exit(0));")
+  const { code, output } = runLib(root)
+  assert.equal(code, 1)
+  assert.match(output, /before-quit handler does not return early while disposing/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('rejects when neither --app-root nor --lib-root is given', () => {
+  try {
+    execFileSync(process.execPath, [script], { encoding: 'utf8', stdio: 'pipe' })
+    assert.fail('should have exited nonzero')
+  } catch (error) {
+    assert.equal(error.status, 2)
+  }
+})

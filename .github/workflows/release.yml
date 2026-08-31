@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         default: "yarn workspace"
+      updater-contract-mode:
+        description: "How to verify the macOS updater handoff contract. 'app-root' scans the packaged .app's asar.unpacked; 'lib-root' reads the compiled shell sources (updater.js + main.js) — for products that keep runtime JS inside app.asar with no asarUnpack."
+        required: false
+        type: string
+        default: "app-root"
     secrets:
       APPLE_CERTIFICATE:
         required: true
@@ -290,16 +295,21 @@ jobs:
       # A correctly signed, notarized build can still ship an update that never
       # installs, and nothing downstream would notice: the pipeline goes green and
       # the failure only surfaces on a user's machine. Assert the two macOS install
-      # handoff contracts against the packaged bundle before publishing it.
+      # handoff contracts before publishing it. app-root scans the packaged bundle;
+      # lib-root reads the compiled shell sources (products with no asarUnpack).
       - name: Verify macOS updater contract
         shell: bash
         run: |
-          app="$(find "$DESKTOP_PACKAGE_PATH/dist/mac-release" -maxdepth 2 -type d -name '*.app' -print -quit)"
-          if [[ -z "$app" ]]; then
-            echo "::error ::No .app bundle found under $DESKTOP_PACKAGE_PATH/dist/mac-release"
-            exit 1
+          if [ "${{ inputs['updater-contract-mode'] }}" = "lib-root" ]; then
+            node .release-kit/scripts/verify-updater-contract.mjs --lib-root "$DESKTOP_PACKAGE_PATH/lib"
+          else
+            app="$(find "$DESKTOP_PACKAGE_PATH/dist/mac-release" -maxdepth 2 -type d -name '*.app' -print -quit)"
+            if [[ -z "$app" ]]; then
+              echo "::error ::No .app bundle found under $DESKTOP_PACKAGE_PATH/dist/mac-release"
+              exit 1
+            fi
+            node .release-kit/scripts/verify-updater-contract.mjs --app-root "$app"
           fi
-          node .release-kit/scripts/verify-updater-contract.mjs --app-root "$app"
 
       # A green package + upload can still name artifacts that do not exist:
       # electron-builder sanitizes productName into the manifest filename, so an
