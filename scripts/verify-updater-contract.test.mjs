@@ -46,14 +46,23 @@ test('accepts minified output', () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-test('rejects quitAndInstall without a preceding prepareToQuit', () => {
+test('accepts any shutdown handoff name, not just prepareToQuit', () => {
+  const root = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => { this.beginShutdown(); autoUpdater.quitAndInstall(false, true); });
+  `)
+  assert.equal(run(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('rejects quitAndInstall without a preceding shutdown handoff', () => {
   const root = appWith(`
     autoUpdater.autoInstallOnAppQuit = false;
     setImmediate(() => { autoUpdater.quitAndInstall(false, true); });
   `)
   const { code, output } = run(root)
   assert.equal(code, 1)
-  assert.match(output, /not immediately preceded by prepareToQuit/u)
+  assert.match(output, /not immediately preceded by a shutdown handoff call/u)
   rmSync(root, { recursive: true, force: true })
 })
 

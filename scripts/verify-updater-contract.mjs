@@ -1,16 +1,22 @@
 #!/usr/bin/env node
-// Gate the two macOS auto-update contracts that a green pipeline cannot otherwise
-// catch: both failure modes ship a correctly signed, notarized package whose
-// update simply never installs.
+// Gate the two macOS auto-update contracts that a green pipeline cannot
+// otherwise catch: both failure modes ship a correctly signed, notarized
+// package whose update simply never installs.
 //
-//   1. quitAndInstall() reaches app.quit(), but a shell that hides its window on
-//      'close' until a quitting flag is set will preventDefault() that quit. The
-//      process stays in its run loop and Squirrel's ShipIt helper waits forever
-//      for an exit that never comes.
-//   2. MacUpdater.quitAndInstall() only calls nativeUpdater.checkForUpdates() —
-//      the step that makes native Squirrel stage the zip and write
-//      ShipItState.plist — while autoInstallOnAppQuit is false. Setting it true
-//      skips that call, so ShipIt finds no state to install and retries forever.
+//   1. quitAndInstall() drives app.quit(). The shell's shutdown handler
+//      preventDefault()s the quit and starts its own teardown, which must be
+//      allowed to finish before the update install runs. The install call
+//      therefore has to sit in the same statement sequence as a shutdown
+//      handoff — never bare on its own. The handoff's name is product-specific
+//      (prepareToQuit / beginShutdown / requestShutdown…), so the gate accepts
+//      any preceding method call instead of coupling to one app's naming.
+//   2. MacUpdater decides who triggers the native checkForUpdates() that makes
+//      Squirrel stage the zip and write ShipItState.plist based on
+//      autoInstallOnAppQuit (MacUpdater.js). With `true` it fires the moment
+//      the download finishes — staging an install the user has not agreed to,
+//      and its quitAndInstall path then bypasses the app's own disposal. It
+//      must be `false` so the trigger stays inside quitAndInstall(), after the
+//      handoff.
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, sep } from 'node:path'
 
@@ -58,11 +64,14 @@ const failures = []
 for (const path of sources) {
   const text = readFileSync(path, 'utf8')
 
-  // The quit flag must be raised in the same statement sequence as the install
-  // call. Allow minified and formatted output, but not a distant unrelated call.
-  const handoff = /prepareToQuit\(\)\s*;?\s*(?:\/\*[\s\S]*?\*\/\s*)?autoUpdater\.quitAndInstall/u
+  // The shutdown handoff must be raised in the same statement sequence as the
+  // install call. Accept any preceding method call — the handoff name is
+  // product-specific, so binding to prepareToQuit() or beginShutdown() would
+  // couple the gate to one app's naming. Allow minified and formatted output,
+  // but not a bare quitAndInstall.
+  const handoff = /(?:[\w$]+\.)?[\w$]+\([^)]*\)\s*;?\s*(?:\/\*[\s\S]*?\*\/\s*)?(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
   if (!handoff.test(text)) {
-    failures.push(`${path}: quitAndInstall is not immediately preceded by prepareToQuit()`)
+    failures.push(`${path}: quitAndInstall is not immediately preceded by a shutdown handoff call`)
   }
 
   if (/autoInstallOnAppQuit\s*=\s*(?:true|!0)\b/u.test(text)) {

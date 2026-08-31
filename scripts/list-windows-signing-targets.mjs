@@ -15,9 +15,6 @@ if (executableName.includes("/") || executableName.includes("\\") || executableN
 
 const requiredRelativePaths = [executableName];
 
-// Present only for some electron-builder layouts / optional bundled tools.
-const optionalRelativePaths = [];
-
 const rootIndex = process.argv.indexOf("--root");
 const rootArgument = rootIndex === -1 ? undefined : process.argv[rootIndex + 1];
 
@@ -42,11 +39,4 @@ for (const targetRelativePath of requiredRelativePaths) {
     throw new Error(`Expected Windows signing target is missing: ${targetPath}`);
   }
   console.log(targetPath);
-}
-
-for (const targetRelativePath of optionalRelativePaths) {
-  const targetPath = resolveInsideRoot(targetRelativePath);
-  if (existsSync(targetPath) && statSync(targetPath).isFile()) {
-    console.log(targetPath);
-  }
 }

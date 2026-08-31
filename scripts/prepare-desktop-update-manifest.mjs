@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { basename } from "node:path";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { parse, stringify } from "yaml";
 import { parseReleaseVersion } from "./release-version-utils.mjs";
@@ -11,7 +9,6 @@ function usageAndExit(code = 1) {
     [
       "Usage:",
       "  node scripts/prepare-desktop-update-manifest.mjs --manifest <path> --version <version> [--base-url <url>]",
-      "  node scripts/prepare-desktop-update-manifest.mjs --generate-from-file <path> --manifest <path> --version <version> [--base-url <url>]",
       "",
     ].join("\n"),
   );
@@ -21,7 +18,6 @@ function usageAndExit(code = 1) {
 function parseArgs(argv) {
   let manifestPath = "";
   let version = "";
-  let generateFromFilePath = "";
   let baseUrl = "";
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -33,11 +29,6 @@ function parseArgs(argv) {
     }
     if (arg === "--version") {
       version = argv[index + 1] ?? "";
-      index += 1;
-      continue;
-    }
-    if (arg === "--generate-from-file") {
-      generateFromFilePath = argv[index + 1] ?? "";
       index += 1;
       continue;
     }
@@ -56,7 +47,7 @@ function parseArgs(argv) {
     usageAndExit();
   }
 
-  return { generateFromFilePath, manifestPath, version, baseUrl };
+  return { manifestPath, version, baseUrl };
 }
 
 function isRecord(value) {
@@ -143,40 +134,7 @@ export function prepareDesktopUpdateManifest(source, options) {
   return stringify(manifest);
 }
 
-export async function generateDesktopUpdateManifestFromFile(options) {
-  const version = validateReleaseVersion(options?.version);
-  const baseUrl = options?.baseUrl ?? "";
-  const filePath = readManifestString(options?.filePath, "file path");
-  const fileName = basename(filePath);
-  const [buffer, stats] = await Promise.all([readFile(filePath), stat(filePath)]);
-  const sha512 = createHash("sha512").update(buffer).digest("base64");
-
-  return stringify({
-    version,
-    files: [
-      {
-        url: prefixDesktopUpdatePath(fileName, version, baseUrl),
-        sha512,
-        size: stats.size,
-      },
-    ],
-    path: prefixDesktopUpdatePath(fileName, version, baseUrl),
-    sha512,
-    releaseDate: new Date().toISOString(),
-  });
-}
-
 export async function prepareDesktopUpdateManifestFile(options) {
-  if (options.generateFromFilePath) {
-    const output = await generateDesktopUpdateManifestFromFile({
-      filePath: options.generateFromFilePath,
-      version: options.version,
-      baseUrl: options.baseUrl,
-    });
-    await writeFile(options.manifestPath, output);
-    return;
-  }
-
   const source = await readFile(options.manifestPath, "utf-8");
   const output = prepareDesktopUpdateManifest(source, {
     version: options.version,

@@ -7,6 +7,7 @@
 electron-builder：
 
 - `appId`、`productName` 按产品填写。
+- **三处 `artifactName` 必须显式设置**（mac 的 dmg/zip、nsis），不许依赖 `productName` 缺省推导：`productName` 带空格时 electron-builder 会把 manifest 里的文件名替换成连字符，GitHub 资产又替换成点号，三个名字互相打架，manifest 指向的文件磁盘上根本不存在——打包、签名、上传全绿，接 R2 后客户端必 404。
 - `nsis.useZip: true`（安装器内是 `app-64.zip`；kit 同时接受 `app-64.7z`）。
 - Windows 安装器 `artifactName` 必须匹配 `{installer-prefix}-${version}-${arch}-Setup.${ext}`。
 - 打包命令走 `--publish never`。
@@ -136,6 +137,8 @@ gh api orgs/<org> -q '.plan.name'   # free → 必须 repo 级；team/enterprise
 失败特征：日志里 `CSC_LINK:` 后面是**空的**（而不是报值错误），签名步骤 2 秒内挂在 `A valid Developer ID Application certificate ... is required`。
 
 Caller 的 `GITHUB_TOKEN` 需能读取本 kit（公开仓库，或同 org 允许访问 private repo）。R2 走 org Cloudflare 账户 endpoint。
+
+**产品 repo 必须与 kit 同 org（SeaBrains）。** kit 是 private reusable workflow，GitHub 规定 private reusable workflow 只能被同 org 的仓库 `uses:`，跨 org 直接 404，token 绕不过。所有客户端 repo 都放 SeaBrains 下。
 
 ## 4. Self-hosted `sign` runner
 

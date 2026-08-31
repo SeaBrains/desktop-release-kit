@@ -41,7 +41,6 @@ const entries = [
   ["IS_RELEASE_CANDIDATE", info.isReleaseCandidate ? "true" : "false"],
   ["RELEASE_TYPE", info.releaseType],
   ["DESKTOP_VERSION", info.version],
-  ["IS_SMOKE_TAG", info.isSmokeTag ? "true" : "false"],
 ];
 
 for (const [key, value] of entries) {
