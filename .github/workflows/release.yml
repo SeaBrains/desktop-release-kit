@@ -127,9 +127,13 @@ jobs:
           fail() { echo "::error ::$*"; exit 1; }
           [[ "$PRODUCT_SLUG" =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || fail "product-slug must match ^[a-z0-9][a-z0-9-]{1,40}$"
           [[ "$R2_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,62}$ ]] || fail "r2-bucket must match ^[a-z0-9][a-z0-9.-]{1,62}$"
-          name_ok() { [[ "$1" =~ ^[^/\\$\`\"\'[:space:]]+$ ]] && [[ "$1" != *[*?[]* ]]; }
-          name_ok "$INSTALLER_PREFIX" || fail "installer-prefix must not contain / \\ \$ \` \" ' whitespace or glob metacharacters (* ? [)"
-          name_ok "$RELEASE_EXECUTABLE_NAME" || fail "executable-name must not contain / \\ \$ \` \" ' whitespace or glob metacharacters (* ? [)"
+          # installer-prefix is spliced into glob patterns; must be space- and glob-free.
+          prefix_ok() { [[ "$1" != *' '* ]] && [[ "$1" != *[*?[]* ]] && [[ "$1" != */* ]]; }
+          # executable-name may contain spaces (e.g. "SeaVerse Harness.exe"); reject
+          # only shell/glob hazards.
+          exe_ok() { [[ "$1" != *[*?[]* ]] && [[ "$1" != *[\\\$\`\"\']* ]] && [[ "$1" != */* ]]; }
+          prefix_ok "$INSTALLER_PREFIX" || fail "installer-prefix must not contain / whitespace or glob metacharacters (* ? [)"
+          exe_ok "$RELEASE_EXECUTABLE_NAME" || fail "executable-name must not contain / \\ \$ \` \" ' or glob metacharacters (* ? [)"
 
       - name: Resolve kit source
         id: kit
