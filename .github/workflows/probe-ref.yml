@@ -1,0 +1,16 @@
+name: Probe JobWorkflowRef
+on:
+  workflow_call:
+env:
+  TOP_LEVEL_REF: ${{ github.job_workflow_ref }}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare scopes
+        env:
+          STEP_LEVEL_REF: ${{ github.job_workflow_ref }}
+        run: |
+          echo "top-level env:  [${TOP_LEVEL_REF}]"
+          echo "step-level env: [${STEP_LEVEL_REF}]"
+          echo "inline: [${{ github.job_workflow_ref }}]"
