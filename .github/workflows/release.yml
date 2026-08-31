@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         default: "yarn workspace"
+      kit-ref:
+        description: "Fallback kit reference <owner>/desktop-release-kit/.github/workflows/release.yml@<sha> used when github.job_workflow_ref is empty. Pass the same repo and SHA as the caller's `uses:` line."
+        required: false
+        type: string
+        default: ""
       updater-contract-mode:
         description: "How to verify the macOS updater handoff contract. 'app-root' scans the packaged .app's asar.unpacked; 'lib-root' reads the compiled shell sources (updater.js + main.js) — for products that keep runtime JS inside app.asar with no asarUnpack."
         required: false
@@ -106,10 +111,11 @@ env:
   R2_ENDPOINT: https://75615ad798eee20d0c0fa5cfb354ced6.r2.cloudflarestorage.com
   DOWNLOADS_BASE: ${{ inputs['downloads-base'] }}
   RELEASE_TAG_PREFIX: ${{ inputs['tag-prefix'] }}
-  # job_workflow_ref is the called kit workflow (owner/kit/.github/workflows/release.yml@ref).
-  # Never fall back to github.workflow_ref (the caller) — that would checkout
-  # the product repo on sign runners.
-  KIT_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+  # job_workflow_ref is the called kit workflow (owner/kit/.github/workflows/release.yml@ref)
+  # but some GitHub deployments leave it empty, so the caller passes kit-ref as
+  # an explicit fallback. Never fall back to github.workflow_ref (the caller) —
+  # that would checkout the product repo on sign runners.
+  KIT_WORKFLOW_REF: ${{ github.job_workflow_ref || inputs['kit-ref'] }}
   INSTALL_COMMAND: ${{ inputs['install-command'] }}
   BUILD_COMMAND: ${{ inputs['build-command'] }}
   WORKSPACE_RUN_PREFIX: ${{ inputs['workspace-run-prefix'] }}
