@@ -520,6 +520,10 @@ jobs:
         with:
           name: win-unpacked-${{ env.DESKTOP_VERSION }}
           path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked/
+          # upload-artifact globs omit dotfiles by default; pi-ai's runtime
+          # imports dist/providers/data/.manifest.json, so it must survive the
+          # trip to the signing runner and into the installer.
+          include-hidden-files: true
           retention-days: 1
 
   # The Jenkins signing runner can reach the private signing service, while the
@@ -586,6 +590,9 @@ jobs:
         with:
           name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
           path: win-unpacked/
+          # Same dotfile preservation as the unsigned upload — the installer
+          # payload is built from this directory.
+          include-hidden-files: true
           retention-days: 1
 
   # Build the NSIS installer on Windows from the signed app directory. The
