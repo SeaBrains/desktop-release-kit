@@ -85,6 +85,33 @@ test('rejects a runtime that never sets autoInstallOnAppQuit', () => {
   rmSync(root, { recursive: true, force: true })
 })
 
+test('rejects a forced exit scheduled after quitAndInstall', () => {
+  // The real incident shape: a setTimeout(app.exit) "fallback" beheads
+  // Squirrel's install chain, which runs in the old process for seconds.
+  const root = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => {
+      this.prepareToQuit();
+      autoUpdater.quitAndInstall(false, true);
+      setTimeout(() => app.exit(0), 3_000);
+    });
+  `)
+  const { code, output } = run(root)
+  assert.equal(code, 1)
+  assert.match(output, /forced exit .* follows quitAndInstall/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('allows app.exit in an adjacent block after the install callback closes', () => {
+  const root = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => { this.prepareToQuit(); autoUpdater.quitAndInstall(false, true); });
+    function escalate() { app.exit(1); }
+  `)
+  assert.equal(run(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
+
 test('ignores electron-updater library sources that define the defaults', () => {
   // The library's own AppUpdater.js assigns autoInstallOnAppQuit = true; scanning it
   // would fail every compliant build.
@@ -135,6 +162,38 @@ const LIB_MAIN = `
 
 test('lib-root accepts compliant updater.js + main.js', () => {
   const root = libWith(LIB_UPDATER, LIB_MAIN)
+  assert.equal(runLib(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('lib-root rejects a forced exit after quitAndInstall inside the handoff', () => {
+  const root = libWith(
+    `
+    autoUpdater.autoInstallOnAppQuit = false;
+    beginShutdown(() => {
+      autoUpdater.quitAndInstall(false, true);
+      setTimeout(() => app.exit(0), 3_000);
+    });
+    `,
+    LIB_MAIN,
+  )
+  const { code, output } = runLib(root)
+  assert.equal(code, 1)
+  assert.match(output, /forced exit .* follows quitAndInstall/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('lib-root accepts comments between beginShutdown and quitAndInstall', () => {
+  const root = libWith(
+    `
+    autoUpdater.autoInstallOnAppQuit = false;
+    beginShutdown(() => {
+      // Squirrel's chain runs in this process; let it drive the exit.
+      autoUpdater.quitAndInstall(false, true);
+    });
+    `,
+    LIB_MAIN,
+  )
   assert.equal(runLib(root).code, 0)
   rmSync(root, { recursive: true, force: true })
 })

@@ -24,6 +24,14 @@
 //      and its quitAndInstall path then bypasses the app's own disposal. It
 //      must be `false` so the trigger stays inside quitAndInstall(), after the
 //      handoff.
+//   3. quitAndInstall() starts Squirrel's install chain IN the old process —
+//      fetch the staged zip from the local proxy, unpack, verify, submit the
+//      install to ShipIt, then terminate the app. That takes seconds for a
+//      150MB+ zip, so a forced exit scheduled after the call (app.exit /
+//      process.exit in a setTimeout) beheads the chain before ShipIt is even
+//      submitted: the staged bundle sits complete in the ShipIt cache, no
+//      ShipIt log, no swap, and the pipeline behind it is green. The process
+//      must exit only through Squirrel's own terminate.
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, sep } from 'node:path'
 
@@ -90,7 +98,32 @@ function checkAppRoot() {
     if (!/autoInstallOnAppQuit\s*=\s*(?:false|!1)\b/u.test(text)) {
       failures.push(`${path}: autoInstallOnAppQuit is never set false`)
     }
+
+    // Contract 3: nothing may force-exit after the install call. Squirrel's
+    // chain (fetch → unpack → verify → submit to ShipIt → terminate) runs in
+    // this process and takes seconds; a scheduled exit beheads it silently.
+    if (forcedExitAfterInstall(text)) {
+      failures.push(`${path}: a forced exit (app.exit/process.exit) follows quitAndInstall — Squirrel's install chain runs in the old process and must drive the exit itself`)
+    }
   }
+}
+
+/**
+ * True when a forced exit follows any quitAndInstall call inside the same
+ * block. Comments are stripped first — prose like "quitAndInstall() drives
+ * app.quit()" must not read as code. The scan window ends at the block's
+ * closing brace so a legitimate app.exit in an adjacent function (e.g. a
+ * shutdown grace-period escalation bundled nearby) does not trip it.
+ */
+function forcedExitAfterInstall(source) {
+  const text = source.replaceAll(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, '')
+  for (const match of text.matchAll(/quitAndInstall\s*\([^)]*\)/gu)) {
+    const rest = text.slice(match.index + match[0].length, match.index + match[0].length + 500)
+    const blockEnd = rest.indexOf('}')
+    const window = blockEnd === -1 ? rest : rest.slice(0, blockEnd)
+    if (/(?:app|process)\s*\.\s*exit\s*\(/u.test(window)) return true
+  }
+  return false
 }
 
 function checkLibRoot() {
@@ -106,9 +139,12 @@ function checkLibRoot() {
     failures.push('updater.js: no quitAndInstall call found')
   }
   // Every install call must sit inside the beginShutdown handoff callback.
-  const handoff = /beginShutdown\(\s*(?:\(\)\s*=>|function\s*\(\s*\))\s*\{\s*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
+  const handoff = /beginShutdown\(\s*(?:\(\)\s*=>|function\s*\(\s*\))\s*\{\s*(?:(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/)\s*)*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
   if (installCalls > 0 && !handoff.test(updater)) {
     failures.push('updater.js: quitAndInstall is not wrapped in the beginShutdown handoff')
+  }
+  if (forcedExitAfterInstall(updater)) {
+    failures.push("updater.js: a forced exit (app.exit/process.exit) follows quitAndInstall — Squirrel's install chain runs in the old process and must drive the exit itself")
   }
 
   const main = readFileSync(join(libRoot, 'main.js'), 'utf8')
