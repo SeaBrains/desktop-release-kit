@@ -102,6 +102,60 @@ test('rejects a forced exit scheduled after quitAndInstall', () => {
   rmSync(root, { recursive: true, force: true })
 })
 
+test('rejects an exit scheduled after an interposed nested block', () => {
+  // A nested block whose `}` closes before the exit must not truncate the
+  // scan window: the exit still sits in the same enclosing block.
+  const root = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => {
+      this.prepareToQuit();
+      autoUpdater.quitAndInstall(false, true);
+      if (debug) { log('installing'); }
+      setTimeout(() => app.exit(0), 3_000);
+    });
+  `)
+  const { code, output } = run(root)
+  assert.equal(code, 1)
+  assert.match(output, /forced exit .* follows quitAndInstall/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('rejects an exit separated from the install call by long filler', () => {
+  const filler = Array.from({ length: 40 }, (_, i) => `log('step ${i} of the teardown sequence');`).join('\n      ')
+  const root = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => {
+      this.prepareToQuit();
+      autoUpdater.quitAndInstall(false, true);
+      ${filler}
+      process.exit(0);
+    });
+  `)
+  const { code, output } = run(root)
+  assert.equal(code, 1)
+  assert.match(output, /forced exit .* follows quitAndInstall/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('string literals neither hide code nor read as code', () => {
+  // A "//"-bearing string must not swallow the rest of a minified line, and
+  // an "app.exit(0)" inside a string must not count as a call.
+  const hidden = appWith(
+    'autoUpdater.autoInstallOnAppQuit=!1;setImmediate(()=>{p.prepareToQuit();autoUpdater.quitAndInstall(!1,!0);log("see https://example.com/docs");setTimeout(()=>app.exit(0),3e3)});',
+  )
+  const hiddenResult = run(hidden)
+  assert.equal(hiddenResult.code, 1)
+  assert.match(hiddenResult.output, /forced exit .* follows quitAndInstall/u)
+  rmSync(hidden, { recursive: true, force: true })
+
+  const prose = appWith(`
+    autoUpdater.autoInstallOnAppQuit = false;
+    setImmediate(() => { this.prepareToQuit(); autoUpdater.quitAndInstall(false, true); log("never call app.exit(0) here"); });
+  `)
+  assert.equal(run(prose).code, 0)
+  rmSync(prose, { recursive: true, force: true })
+})
+
 test('allows app.exit in an adjacent block after the install callback closes', () => {
   const root = appWith(`
     autoUpdater.autoInstallOnAppQuit = false;

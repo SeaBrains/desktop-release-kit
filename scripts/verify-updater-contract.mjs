@@ -80,14 +80,17 @@ function checkAppRoot() {
   }
 
   for (const path of sources) {
-    const text = readFileSync(path, 'utf8')
+    // Comments and strings are blanked so prose never reads as code — in
+    // either direction: a comment saying "app.exit()" must not trip a check,
+    // and a string containing "//" must not swallow the rest of the line.
+    const text = blankNonCode(readFileSync(path, 'utf8'))
 
     // The shutdown handoff must be raised in the same statement sequence as the
     // install call. Accept any preceding method call — the handoff name is
     // product-specific, so binding to prepareToQuit() or beginShutdown() would
     // couple the gate to one app's naming. Allow minified and formatted output,
     // but not a bare quitAndInstall.
-    const handoff = /(?:[\w$]+\.)?[\w$]+\([^)]*\)\s*;?\s*(?:\/\*[\s\S]*?\*\/\s*)?(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
+    const handoff = /(?:[\w$]+\.)?[\w$]+\([^)]*\)\s*;?\s*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
     if (!handoff.test(text)) {
       failures.push(`${path}: quitAndInstall is not immediately preceded by a shutdown handoff call`)
     }
@@ -109,25 +112,74 @@ function checkAppRoot() {
 }
 
 /**
+ * Blank comments, strings, and template literals with spaces, preserving
+ * offsets. Prose like "quitAndInstall() drives app.quit()" in a comment, or a
+ * URL's `//` inside a string, must neither read as code nor derail the scan.
+ */
+function blankNonCode(source) {
+  let out = ''
+  let i = 0
+  const n = source.length
+  while (i < n) {
+    const c = source[i]
+    if (c === '/' && source[i + 1] === '/') {
+      const nl = source.indexOf('\n', i)
+      const stop = nl === -1 ? n : nl
+      out += ' '.repeat(stop - i)
+      i = stop
+    } else if (c === '/' && source[i + 1] === '*') {
+      const end = source.indexOf('*/', i + 2)
+      const stop = end === -1 ? n : end + 2
+      out += ' '.repeat(stop - i)
+      i = stop
+    } else if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1
+      while (j < n) {
+        if (source[j] === '\\') j += 2
+        else if (source[j] === c) { j += 1; break }
+        else j += 1
+      }
+      out += ' '.repeat(Math.min(j, n) - i)
+      i = j
+    } else {
+      out += c
+      i += 1
+    }
+  }
+  return out
+}
+
+/**
  * True when a forced exit follows any quitAndInstall call inside the same
- * block. Comments are stripped first — prose like "quitAndInstall() drives
- * app.quit()" must not read as code. The scan window ends at the block's
- * closing brace so a legitimate app.exit in an adjacent function (e.g. a
- * shutdown grace-period escalation bundled nearby) does not trip it.
+ * block. Runs on blanked source, and the window is brace-depth aware: it
+ * extends to the end of the enclosing block — through nested blocks like a
+ * setTimeout callback or an if — so scheduling the exit later in the block
+ * cannot slip past, while a legitimate app.exit in an adjacent function (e.g.
+ * a shutdown grace-period escalation) stays out of scope.
  */
 function forcedExitAfterInstall(source) {
-  const text = source.replaceAll(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/gu, '')
+  const text = blankNonCode(source)
   for (const match of text.matchAll(/quitAndInstall\s*\([^)]*\)/gu)) {
-    const rest = text.slice(match.index + match[0].length, match.index + match[0].length + 500)
-    const blockEnd = rest.indexOf('}')
-    const window = blockEnd === -1 ? rest : rest.slice(0, blockEnd)
-    if (/(?:app|process)\s*\.\s*exit\s*\(/u.test(window)) return true
+    const start = match.index + match[0].length
+    let depth = 0
+    let end = text.length
+    for (let i = start; i < text.length; i += 1) {
+      const c = text[i]
+      if (c === '{') depth += 1
+      else if (c === '}') {
+        depth -= 1
+        if (depth < 0) { end = i; break }
+      }
+    }
+    if (/(?:app|process)\s*\.\s*exit\s*\(/u.test(text.slice(start, end))) return true
   }
   return false
 }
 
 function checkLibRoot() {
-  const updater = readFileSync(join(libRoot, 'updater.js'), 'utf8')
+  // Blanked so comment prose never reads as code (an "app.exit()" mention
+  // must not trip the exit check, nor count as a quitAndInstall call).
+  const updater = blankNonCode(readFileSync(join(libRoot, 'updater.js'), 'utf8'))
   if (!/autoInstallOnAppQuit\s*=\s*(?:false|!1)\b/u.test(updater)) {
     failures.push('updater.js: autoInstallOnAppQuit is never set false')
   }
@@ -139,7 +191,8 @@ function checkLibRoot() {
     failures.push('updater.js: no quitAndInstall call found')
   }
   // Every install call must sit inside the beginShutdown handoff callback.
-  const handoff = /beginShutdown\(\s*(?:\(\)\s*=>|function\s*\(\s*\))\s*\{\s*(?:(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/)\s*)*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
+  // Comments are already blanked to whitespace, so \s* absorbs them.
+  const handoff = /beginShutdown\(\s*(?:\(\)\s*=>|function\s*\(\s*\))\s*\{\s*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
   if (installCalls > 0 && !handoff.test(updater)) {
     failures.push('updater.js: quitAndInstall is not wrapped in the beginShutdown handoff')
   }
