@@ -8,7 +8,7 @@ electron-builder：
 
 - `appId`、`productName` 按产品填写。
 - **三处 `artifactName` 必须显式设置**（mac 的 dmg/zip、nsis），不许依赖 `productName` 缺省推导：`productName` 带空格时 electron-builder 会把 manifest 里的文件名替换成连字符，GitHub 资产又替换成点号，三个名字互相打架，manifest 指向的文件磁盘上根本不存在——打包、签名、上传全绿，接 R2 后客户端必 404。
-- `nsis.useZip: true`（安装器内是 `app-64.zip`；kit 同时接受 `app-64.7z`）。
+- `nsis.useZip` **保持缺省（不要设 `true`）**：默认产物是 `app-64.7z`，NSIS 原生就能解。设 `true` 打出的是 LZMA 压缩的 `app-64.zip`，NSIS 的 `nsisunz.dll` 解不开，安装/更新一律死在解包（`Error opening ZIP file`）。kit 的产物校验两个名字都认，所以不需要为 kit 迁就 `useZip`。
 - Windows 安装器 `artifactName` 必须匹配 `{installer-prefix}-${version}-${arch}-Setup.${ext}`。
 - 打包命令走 `--publish never`。
 - 输出目录按蓝本：mac → `dist/mac-release/`（`.dmg` / `.zip` / `.blockmap` / `latest-mac.yml`）；win → `dist/win-unpacked/`，安装器 → `dist/{installer-prefix}-*-Setup.exe`。
@@ -47,6 +47,102 @@ setImmediate(() => {
 **② `autoInstallOnAppQuit` 在 macOS 必须是 `false`。**
 
 `MacUpdater.quitAndInstall()` 只在这个值为 `false` 的分支里调 `nativeUpdater.checkForUpdates()`，而那一步才是让原生 Squirrel 从本地代理服务器取包、写 `ShipItState.plist` 的唯一触发点。设成 `true` 会跳过它，ShipIt 起来后找不到 state，报 `Could not read update request` 并每 2 秒重试。
+
+### Windows 覆盖安装契约（产品侧自查，kit 不校验）
+
+Windows 的坑和 macOS 对称：**首次安装永远正常，只有从旧版覆盖安装/自动更新时才炸**，而且报错信息会指向错误的方向。产品必须提供一份 `nsis.include` 指向的 `installer.nsh`，否则迟早撞上。
+
+```yaml
+nsis:
+  include: build/installer.nsh
+```
+
+**① 「XXX 无法关闭，请手动关闭它然后单击重试」这句提示是假的。**
+
+它不代表 App 还在运行。这句来自 app-builder-lib `include/installUtil.nsh` 的 `uninstallOldVersion`：它会执行**旧版本的卸载器**最多 5 次，只接受退出码 0，5 次都非 0 才弹这个框：
+
+```nsis
+UninstallLoop:
+  IntOp $R5 $R5 + 1
+  ${if} $R5 > 5
+    MessageBox ... "$(appCannotBeClosed)" ...     ; ← 用户看到的框
+  OneMoreAttempt:
+    ExecWait '"old-uninstaller.exe" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0
+  CheckResult:
+    ${if} $R0 == 0 → Return                        ; 只有 0 算成功
+    Sleep 1000 → Goto UninstallLoop
+```
+
+判据：**进度条走到一半才弹**（不是安装器一启动就弹），且杀光所有进程、`$INSTDIR` 能自由 rename，点重试照样弹 → 就是这条。手动复现拿真实退出码：
+
+```powershell
+# 完全照抄安装器的调用形式，注意 _?= 和 --updated
+& "$env:LOCALAPPDATA\Programs\<App>\Uninstall <App>.exe" /S /KEEP_APP_DATA /currentuser --updated "_?=$env:LOCALAPPDATA\Programs\<App>"
+$LASTEXITCODE   # 非 0（常见 2）即命中
+```
+
+根因是 electron-builder#9593：旧版卸载器自身 abort（退出码 2）。**旧包已经发出去了，改不了了**，只能在新安装器里绕过它。解法是在 `customInit` 里删掉旧的 uninstall 注册表键——`uninstallOldVersion` 靠读 `UninstallString` 才能找到旧卸载器，读不到就整段跳过，新安装照常写新键：
+
+```nsis
+!ifndef BUILD_UNINSTALLER    ; 必须守卫：卸载器 pass 不插 customInit，
+                             ; 未引用的 Var 会触发 NSIS warning 6001，而 warnings are errors
+Var OldUninstallString
+!macro customInit
+  ; 仅覆盖安装才删；全新安装保持原生流程
+  ${If} ${isUpdated}                                  ; --updated：自动更新relaunch
+  ${OrIf} ...per-user XOR per-machine 存在旧安装...    ; 手动重跑安装器
+    ReadRegStr $OldUninstallString SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" UninstallString
+    ${If} $OldUninstallString != ""
+      DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; 删了键之后若安装中途 Abort，必须还原，否则用户的卸载入口就没了
+Function .onInstFailed
+  ${If} $OldUninstallString != ""
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_GUID}" UninstallString "$OldUninstallString"
+  ${EndIf}
+FunctionEnd
+!endif
+```
+
+时序是安全的：`.onInit` 里 `initMultiUser`（给 `$hasPerUserInstallation` / `$hasPerMachineInstallation` 赋值）**先于** `customInit`。
+
+**② 旧卸载器真跑起来且失败时，要响亮失败，不要试图抢救。**
+
+用 `customUnInstallCheck` / `customUnInstallCheckCurrentUser` 接管：打印退出码、告诉用户去「设置 > 应用」手动卸载后重装，然后 `SetErrorLevel 2` + `Quit`，**现有安装原封不动**。
+
+绝对不要用 `RMDir /r $INSTDIR` 强删来"修复"：NSIS 解压不是事务性的，wipe→extract 之间任何中断（关机、安装器被杀）都会让用户落到一个空目录、App 彻底没了。覆盖装在失败的卸载之上同样错——留下旧版残留文件和过期注册表项，把坏掉的安装状态掩盖过去。
+
+**③ Electron 的子进程都叫同一个 exe 名，会导致真正的"进程没退干净"。**
+
+渲染进程、GPU 进程、以及任何 `process.execPath` spawn 出来的 worker（node helper、node-pty、koffi 之类的原生 worker）在任务管理器里**都显示为主 exe 的名字**。App 正在退出时经常还挂着一两个，而 electron-builder 默认的 `customCheckAppRunning` 只探测不清理。用 `taskkill /T` 杀整棵进程树，再 `Sleep` + `Get-Process` 复验：
+
+```nsis
+!macro customCheckAppRunning
+  loop:
+    nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C taskkill /F /IM "${PRODUCT_FILENAME}.exe" /T'
+    Pop $2
+    Pop $3
+    Sleep 3000
+    ; 复验；仍在 → GUI 弹重试回 loop，静默装 SetErrorLevel 4 + Abort
+!macroend
+```
+
+这和 ① 是**两个独立故障模式**，都要修：① 是旧卸载器坏了，③ 是真有残留 worker。
+
+**④ `nsExec` 字符串里不许出现 PowerShell 的 `$` 变量**（`$_`、`$names`）。NSIS 会 mangle `$$` 转义，生成 ParserError 让脚本 abort——**而这恰恰就是让旧卸载器退出码变成 2、进而触发上面那个假提示的原因**。用单引号字面量的名字列表绕开：
+
+```nsis
+nsExec::ExecToStack `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "if (Get-Process -Name '${PRODUCT_FILENAME}' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"`
+```
+
+`Get-Process` 的 `-Name` 不接受 `.exe` 后缀，且单引号能保住 `PRODUCT_FILENAME` 里的空格。
+
+> 现成实现可直接抄 SeaWork `packages/desktop/build/installer.nsh` 或 SeaVerse Harness `apps/desktop/build/installer.nsh`。
+
+**远程调试提醒**：通过 ssh 跑 Windows 安装器/卸载器时进程落在 **Session 0**（无桌面）。任何非静默的 GUI 会永久挂起，静默模式也可能因拿不到交互而走 `/SD` 默认分支返回失败——测出来的退出码不可信。要在真实交互会话里验证。
 
 ### 建议：接入 updater 日志
 
@@ -153,7 +249,31 @@ label `sign`，能访问内网 Jenkins 签名服务。签名 job **不 checkout 
 
 R2：版本产物 `<slug>/<version>/…`（`--immutable`：同内容已存在则跳过，异内容 412）；指针 `<slug>/latest.yml`、`<slug>/latest-mac.yml`、`<slug>/desktop-version.json`（prerelease 只写 `rc.yml` / `rc-mac.yml`）。feed = `{downloads-base}/{slug}`，manifest 内 url 为 `<version>/<file>`。
 
-同产品可并发发布多个 tag（workflow concurrency 按 tag 隔离）。**指针是最后写入者胜**；强烈建议同一产品串行发布，避免短时间并发多个版本抢写 `latest*` / `desktop-version.json`。失败 tag 重跑是幂等的：已成功上传的同内容对象遇 412 会被跳过，不会卡死。
+同产品可并发发布多个 tag（workflow concurrency 按 tag 隔离）。**指针是最后写入者胜**；强烈建议同一产品串行发布，避免短时间并发多个版本抢写 `latest*` / `desktop-version.json`。
+
+### 重跑失败的 tag：只在产物逐字节可复现时才幂等
+
+版本产物走 `--immutable`（`If-None-Match: *`）。412 时 kit 会取回已有对象比对 sha256：**完全一致才跳过**，否则抛 `R2 PUT rejected (If-None-Match): <key> already exists`。
+
+因此重跑能不能过，取决于这次构建的字节是否和上次完全相同：
+
+- macOS zip/dmg、`latest*.yml` 通常可复现，重跑一般能跳过。
+- **Windows 安装器不可复现**：Jenkins 签名带时间戳，每次重签字节都不同。所以**只要上一次跑已经把 `<slug>/<version>/…-Setup.exe` 传上去了，后续任何重跑都会在这一步硬失败**。
+
+失败特征是**失败点在多次重跑之间漂移**（这次挂 artifact 上传、下次挂某个 R2 PUT），因为每跑一次就多落一批对象，锁住更多路径。
+
+判断方法——先看 R2 上这个版本是不是已经有部分对象：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' "<downloads-base>/<slug>/<version>/<installer>.exe"
+```
+
+返回 200 就**不要再重跑**了。两个选择：
+
+- **推荐：换一个新版本号重发**（新 key 前缀，不与任何已有对象冲突）。旧版本号的对象成为孤儿，无害——`latest*` 指针从没指向过它们（promote 是最后一步，前面挂了就没写成）。
+- 或者先把该版本前缀下的对象清掉再重跑。
+
+注意 `promote` 的 job 条件是 `publish-macos` 和 `sign-windows` **都** success，所以只要有一条腿失败，指针不会被写坏——线上用户始终停在上一个可用版本。
 
 ## 6. 回滚
 
