@@ -3,12 +3,16 @@
 // otherwise catch: each failure mode ships a correctly signed, notarized
 // package whose update simply never installs.
 //
-// Two modes, one contract:
+// Three modes, one contract:
 //
-//   --app-root <path-to-.app>   scan the packaged bundle (app.asar.unpacked)
-//   --lib-root <path-to-lib>    scan the compiled shell sources (updater.js +
-//                               main.js) — for products that keep runtime JS
-//                               inside app.asar with no asarUnpack
+//   --app-root <path-to-.app>           scan the packaged bundle (app.asar.unpacked)
+//   --lib-root <path-to-lib>            scan the compiled shell sources (updater.js +
+//                                       main.js) — for products that keep runtime JS
+//                                       inside app.asar with no asarUnpack
+//   --bundle-root <path-to-output-dir>  scan a compiled output directory with the
+//                                       same generic assertions as app-root — for
+//                                       single-file bundles with no asarUnpack
+//                                       (e.g. electron-vite index.cjs)
 //
 //   1. quitAndInstall() drives app.quit(). The shell's shutdown handler
 //      preventDefault()s the quit and starts its own teardown, which must be
@@ -40,8 +44,9 @@ for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i], proce
 
 const appRoot = args.get('--app-root')
 const libRoot = args.get('--lib-root')
-if (appRoot === undefined && libRoot === undefined) {
-  console.error('verify-updater-contract: --app-root <path-to-.app> or --lib-root <path-to-compiled-lib> is required')
+const bundleRoot = args.get('--bundle-root')
+if (appRoot === undefined && libRoot === undefined && bundleRoot === undefined) {
+  console.error('verify-updater-contract: --app-root <path-to-.app>, --lib-root <path-to-compiled-lib>, or --bundle-root <path-to-compiled-output-dir> is required')
   process.exit(2)
 }
 
@@ -58,20 +63,70 @@ function findRuntimeChunks(dir, out = []) {
   for (const entry of entries) {
     const path = join(dir, entry.name)
     if (entry.isDirectory()) findRuntimeChunks(path, out)
-    else if (entry.isFile() && entry.name.endsWith('.js') && statSync(path).size < 4_000_000) out.push(path)
+    else if (entry.isFile() && /\.(?:js|cjs|mjs)$/.test(entry.name) && statSync(path).size < 4_000_000) out.push(path)
   }
   return out
 }
 
-function checkAppRoot() {
-  const unpacked = join(appRoot, 'Contents', 'Resources', 'app.asar.unpacked')
+function findProductInstallChunks(dir) {
   // Only the product's own bundle is in scope. electron-updater's own sources
   // define the library defaults (including autoInstallOnAppQuit = true) and would
   // otherwise trip every assertion below.
-  const sources = findRuntimeChunks(unpacked).filter(path => {
+  return findRuntimeChunks(dir).filter(path => {
     if (path.includes(`${sep}node_modules${sep}`)) return false
     return readFileSync(path, 'utf8').includes('autoUpdater.quitAndInstall')
   })
+}
+
+function assertGenericInstallContracts(path, mode = 'app-root') {
+  // Comments, strings, and regex literals are blanked so prose never reads as
+  // code — in either direction: a comment saying "app.exit()" must not trip a
+  // check, and a string containing "//" must not swallow the rest of the line.
+  const text = blankNonCode(readFileSync(path, 'utf8'))
+
+  // The shutdown handoff must be raised in the same statement sequence as the
+  // install call. Accept any preceding method call — the handoff name is
+  // product-specific, so binding to prepareToQuit() or beginShutdown() would
+  // couple the gate to one app's naming. Allow minified and formatted output,
+  // but not a bare quitAndInstall.
+  const handoff = /(?:[\w$]+\.)?[\w$]+\([^)]*\)\s*;?\s*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
+  if (!handoff.test(text)) {
+    failures.push(`${path}: quitAndInstall is not immediately preceded by a shutdown handoff call`)
+  }
+
+  // bundle-root scans a single compiled file that may inline electron-updater.
+  // The library constructor assigns `this.autoInstallOnAppQuit = true`; that is
+  // not product code. Only a receiver that is exactly `this` is exempt —
+  // `_this` (Babel), `self`, `a.this` all count as product assignments.
+  // app-root still uses the unprefixed form — it already skipped node_modules
+  // by path.
+  if (mode === 'bundle-root') {
+    if (productAutoInstallReceivers(text, 'true|!0').length > 0) {
+      failures.push(`${path}: autoInstallOnAppQuit is set true; macOS installs require false`)
+    }
+    if (productAutoInstallReceivers(text, 'false|!1').length === 0) {
+      failures.push(`${path}: autoInstallOnAppQuit is never set false`)
+    }
+  } else {
+    if (/autoInstallOnAppQuit\s*=\s*(?:true|!0)\b/u.test(text)) {
+      failures.push(`${path}: autoInstallOnAppQuit is set true; macOS installs require false`)
+    }
+    if (!/autoInstallOnAppQuit\s*=\s*(?:false|!1)\b/u.test(text)) {
+      failures.push(`${path}: autoInstallOnAppQuit is never set false`)
+    }
+  }
+
+  // Contract 3: nothing may force-exit after the install call. Squirrel's
+  // chain (fetch → unpack → verify → submit to ShipIt → terminate) runs in
+  // this process and takes seconds; a scheduled exit beheads it silently.
+  if (forcedExitAfterInstall(text)) {
+    failures.push(`${path}: a forced exit (app.exit/process.exit) follows quitAndInstall — Squirrel's install chain runs in the old process and must drive the exit itself`)
+  }
+}
+
+function checkAppRoot() {
+  const unpacked = join(appRoot, 'Contents', 'Resources', 'app.asar.unpacked')
+  const sources = findProductInstallChunks(unpacked)
 
   if (sources.length === 0) {
     console.error(`verify-updater-contract: no product chunk calling autoUpdater.quitAndInstall under ${unpacked}`)
@@ -79,42 +134,95 @@ function checkAppRoot() {
     process.exit(1)
   }
 
-  for (const path of sources) {
-    // Comments and strings are blanked so prose never reads as code — in
-    // either direction: a comment saying "app.exit()" must not trip a check,
-    // and a string containing "//" must not swallow the rest of the line.
-    const text = blankNonCode(readFileSync(path, 'utf8'))
+  for (const path of sources) assertGenericInstallContracts(path)
+}
 
-    // The shutdown handoff must be raised in the same statement sequence as the
-    // install call. Accept any preceding method call — the handoff name is
-    // product-specific, so binding to prepareToQuit() or beginShutdown() would
-    // couple the gate to one app's naming. Allow minified and formatted output,
-    // but not a bare quitAndInstall.
-    const handoff = /(?:[\w$]+\.)?[\w$]+\([^)]*\)\s*;?\s*(?:[\w$]+\.)?(?:autoUpdater\.)?quitAndInstall/u
-    if (!handoff.test(text)) {
-      failures.push(`${path}: quitAndInstall is not immediately preceded by a shutdown handoff call`)
-    }
+function checkBundleRoot() {
+  const sources = findProductInstallChunks(bundleRoot)
 
-    if (/autoInstallOnAppQuit\s*=\s*(?:true|!0)\b/u.test(text)) {
-      failures.push(`${path}: autoInstallOnAppQuit is set true; macOS installs require false`)
-    }
-    if (!/autoInstallOnAppQuit\s*=\s*(?:false|!1)\b/u.test(text)) {
-      failures.push(`${path}: autoInstallOnAppQuit is never set false`)
-    }
-
-    // Contract 3: nothing may force-exit after the install call. Squirrel's
-    // chain (fetch → unpack → verify → submit to ShipIt → terminate) runs in
-    // this process and takes seconds; a scheduled exit beheads it silently.
-    if (forcedExitAfterInstall(text)) {
-      failures.push(`${path}: a forced exit (app.exit/process.exit) follows quitAndInstall — Squirrel's install chain runs in the old process and must drive the exit itself`)
-    }
+  if (sources.length === 0) {
+    console.error(`verify-updater-contract: no product chunk calling autoUpdater.quitAndInstall under ${bundleRoot}`)
+    console.error('Confirm --bundle-root points at the compiled output directory.')
+    process.exit(1)
   }
+
+  for (const path of sources) assertGenericInstallContracts(path, 'bundle-root')
+}
+
+/** Receivers of `X.autoInstallOnAppQuit = <value>` that are not the literal `this`. */
+function productAutoInstallReceivers(text, value) {
+  const re = new RegExp(
+    String.raw`([\w$]+(?:\.[\w$]+)*)\.autoInstallOnAppQuit\s*=\s*(?:${value})\b`,
+    'gu',
+  )
+  return [...text.matchAll(re)].map(m => m[1]).filter(receiver => receiver !== 'this')
+}
+
+const REGEX_PREFIX_PUNCT = '(,=:[!&|?{;*%^~<'
+const REGEX_PREFIX_WORDS = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+  'void', 'case', 'do', 'else', 'yield', 'await',
+])
+
+/** True when `/` at `i` starts a regex literal rather than a division. */
+function isRegexLiteralStart(source, i) {
+  let k = i - 1
+  while (k >= 0 && /\s/.test(source[k])) k -= 1
+  if (k < 0) return true
+  const prev = source[k]
+  // Postfix ++/-- is a value, so the following `/` is division (`count++ / total`).
+  // A lone `+`/`-` is still an operator, so `/` starts a regex.
+  if (prev === '+' || prev === '-') {
+    return !(k > 0 && source[k - 1] === prev)
+  }
+  // Only the arrow `=>` makes `>` a regex prefix; `a > b / c` is division.
+  if (prev === '>') return k > 0 && source[k - 1] === '='
+  if (REGEX_PREFIX_PUNCT.includes(prev)) return true
+  if (/[A-Za-z0-9_$]/.test(prev)) {
+    let start = k
+    while (start > 0 && /[A-Za-z0-9_$]/.test(source[start - 1])) start -= 1
+    return REGEX_PREFIX_WORDS.has(source.slice(start, k + 1))
+  }
+  return false
+}
+
+/** Exclusive end index of a regex literal starting at `start` (the opening `/`). */
+function scanRegexLiteral(source, start) {
+  const n = source.length
+  let i = start + 1
+  let inClass = false
+  while (i < n) {
+    const c = source[i]
+    if (c === '\\') {
+      i += 2
+      continue
+    }
+    if (inClass) {
+      if (c === ']') inClass = false
+      i += 1
+      continue
+    }
+    if (c === '[') {
+      inClass = true
+      i += 1
+      continue
+    }
+    if (c === '/') {
+      i += 1
+      while (i < n && /[A-Za-z]/.test(source[i])) i += 1
+      return i
+    }
+    i += 1
+  }
+  return n
 }
 
 /**
- * Blank comments, strings, and template literals with spaces, preserving
- * offsets. Prose like "quitAndInstall() drives app.quit()" in a comment, or a
- * URL's `//` inside a string, must neither read as code nor derail the scan.
+ * Blank comments, strings, template literals, and regex literals with spaces,
+ * preserving offsets. Prose like "quitAndInstall() drives app.quit()" in a
+ * comment, or a URL's `//` inside a string, must neither read as code nor
+ * derail the scan. Regex literals must be recognized too: `/&#39;/g` contains
+ * quotes that would otherwise desync the string walker.
  */
 function blankNonCode(source) {
   let out = ''
@@ -130,6 +238,10 @@ function blankNonCode(source) {
     } else if (c === '/' && source[i + 1] === '*') {
       const end = source.indexOf('*/', i + 2)
       const stop = end === -1 ? n : end + 2
+      out += ' '.repeat(stop - i)
+      i = stop
+    } else if (c === '/' && isRegexLiteralStart(source, i)) {
+      const stop = Math.min(scanRegexLiteral(source, i), n)
       out += ' '.repeat(stop - i)
       i = stop
     } else if (c === '"' || c === "'" || c === '`') {
@@ -215,6 +327,8 @@ function checkLibRoot() {
 
 if (libRoot !== undefined) {
   checkLibRoot()
+} else if (bundleRoot !== undefined) {
+  checkBundleRoot()
 } else {
   checkAppRoot()
 }

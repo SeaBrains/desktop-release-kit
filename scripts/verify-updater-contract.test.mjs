@@ -279,3 +279,89 @@ test('rejects when neither --app-root nor --lib-root is given', () => {
     assert.equal(error.status, 2)
   }
 })
+
+// --- --bundle-root mode (compiled output directory) ---
+
+function bundleWith(source) {
+  const root = mkdtempSync(join(tmpdir(), 'updater-bundle-'))
+  writeFileSync(join(root, 'index.cjs'), source)
+  return root
+}
+
+function runBundle(root) {
+  try {
+    execFileSync(process.execPath, [script, '--bundle-root', root], { encoding: 'utf8', stdio: 'pipe' })
+    return { code: 0, output: '' }
+  } catch (error) {
+    return { code: error.status, output: `${error.stdout ?? ''}${error.stderr ?? ''}` }
+  }
+}
+
+test('bundle-root accepts inlined library default true plus product false, even with regex-literal quotes', () => {
+  const root = bundleWith(`
+    "".replace(/&#39;/gi, "'").replace(/&quot;/gi, '"');
+    class AppUpdater {
+      constructor() { this.autoInstallOnAppQuit = true; }
+    }
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ autoUpdater.autoInstallOnAppQuit = false; }
+  `)
+  assert.equal(runBundle(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('bundle-root rejects a product assignment of autoInstallOnAppQuit true', () => {
+  const root = bundleWith(`
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ updater.autoInstallOnAppQuit = true; }
+  `)
+  const { code, output } = runBundle(root)
+  assert.equal(code, 1)
+  assert.match(output, /autoInstallOnAppQuit is set true/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('bundle-root rejects _this.autoInstallOnAppQuit = true', () => {
+  const root = bundleWith(`
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ _this.autoInstallOnAppQuit = true; updater.autoInstallOnAppQuit = false; }
+  `)
+  const { code, output } = runBundle(root)
+  assert.equal(code, 1)
+  assert.match(output, /autoInstallOnAppQuit is set true/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('bundle-root does not swallow a real violation after postfix division', () => {
+  const root = bundleWith(`
+    const ratio = count++ / total;
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ updater.autoInstallOnAppQuit = true; }
+  `)
+  const { code, output } = runBundle(root)
+  assert.equal(code, 1)
+  assert.match(output, /autoInstallOnAppQuit is set true/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('bundle-root does not swallow a real violation after an arrow regex literal', () => {
+  const root = bundleWith(`
+    const re = ()=>/don't/;
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ updater.autoInstallOnAppQuit = true; }
+  `)
+  const { code, output } = runBundle(root)
+  assert.equal(code, 1)
+  assert.match(output, /autoInstallOnAppQuit is set true/u)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('bundle-root accepts library this.autoInstallOnAppQuit = true when the product sets false', () => {
+  const root = bundleWith(`
+    this.autoInstallOnAppQuit = true;
+    async function install(beforeQuit){ await beforeQuit(); autoUpdater.quitAndInstall(false,true); }
+    function configure(){ updater.autoInstallOnAppQuit = false; }
+  `)
+  assert.equal(runBundle(root).code, 0)
+  rmSync(root, { recursive: true, force: true })
+})
