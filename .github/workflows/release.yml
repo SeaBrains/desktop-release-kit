@@ -72,10 +72,20 @@ on:
         required: true
         type: string
       updater-contract-mode:
-        description: "How to verify the macOS updater handoff contract. 'app-root' scans the packaged .app's asar.unpacked; 'lib-root' reads the compiled shell sources (updater.js + main.js) — for products that keep runtime JS inside app.asar with no asarUnpack."
+        description: "How to verify the macOS updater handoff contract. 'app-root' scans the packaged .app's asar.unpacked; 'lib-root' reads the compiled shell sources (updater.js + main.js) — for products that keep runtime JS inside app.asar with no asarUnpack; 'bundle-root' scans a compiled output directory with the same generic assertions as app-root — for single-file bundles with no asarUnpack (e.g. electron-vite index.cjs)."
         required: false
         type: string
         default: "app-root"
+      updater-contract-lib-path:
+        description: "Relative path (from package-path) to the compiled shell sources scanned in lib-root mode. The directory must contain updater.js and main.js."
+        required: false
+        type: string
+        default: "lib"
+      updater-contract-bundle-path:
+        description: "Relative path (from package-path) to the compiled output directory scanned in bundle-root mode."
+        required: false
+        type: string
+        default: ""
     secrets:
       APPLE_CERTIFICATE:
         required: true
@@ -314,14 +324,17 @@ jobs:
 
       # A correctly signed, notarized build can still ship an update that never
       # installs, and nothing downstream would notice: the pipeline goes green and
-      # the failure only surfaces on a user's machine. Assert the two macOS install
+      # the failure only surfaces on a user's machine. Assert the macOS install
       # handoff contracts before publishing it. app-root scans the packaged bundle;
-      # lib-root reads the compiled shell sources (products with no asarUnpack).
+      # lib-root reads the compiled shell sources (products with no asarUnpack);
+      # bundle-root scans a compiled output directory with the generic assertions.
       - name: Verify macOS updater contract
         shell: bash
         run: |
           if [ "${{ inputs['updater-contract-mode'] }}" = "lib-root" ]; then
-            node .release-kit/scripts/verify-updater-contract.mjs --lib-root "$DESKTOP_PACKAGE_PATH/lib"
+            node .release-kit/scripts/verify-updater-contract.mjs --lib-root "$DESKTOP_PACKAGE_PATH/${{ inputs['updater-contract-lib-path'] }}"
+          elif [ "${{ inputs['updater-contract-mode'] }}" = "bundle-root" ]; then
+            node .release-kit/scripts/verify-updater-contract.mjs --bundle-root "$DESKTOP_PACKAGE_PATH/${{ inputs['updater-contract-bundle-path'] }}"
           else
             app="$(find "$DESKTOP_PACKAGE_PATH/dist/mac-release" -maxdepth 2 -type d -name '*.app' -print -quit)"
             if [[ -z "$app" ]]; then
