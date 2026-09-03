@@ -99,6 +99,12 @@ on:
         required: true
       JENKINS_SIGN_TOKEN:
         required: true
+      RUSTFS_ENDPOINT:
+        required: true
+      RUSTFS_ACCESS_KEY:
+        required: true
+      RUSTFS_SECRET_KEY:
+        required: true
 
 concurrency:
   group: desktop-release-${{ inputs['product-slug'] }}-${{ github.ref_name }}
@@ -513,23 +519,32 @@ jobs:
         shell: bash
         run: ${{ env.WORKSPACE_RUN_PREFIX }} "$DESKTOP_WORKSPACE" dist:win-unpacked
 
-      # The unsigned app travels to the signing stage via a run-scoped artifact:
-      # private, no extra credentials on the self-hosted sign runner.
-      - name: Upload unsigned app artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: win-unpacked-${{ env.DESKTOP_VERSION }}
-          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked/
-          # upload-artifact globs omit dotfiles by default; pi-ai's runtime
-          # imports dist/providers/data/.manifest.json, so it must survive the
-          # trip to the signing runner and into the installer.
-          include-hidden-files: true
-          retention-days: 1
+      # Sign runner → Azure blob (actions artifact store) is unreliable (KB/s).
+      # RustFS is 5-6MB/s; a single tar.gz also keeps dotfiles intact.
+      # Key includes $GITHUB_RUN_ID so two tags that normalize to the same
+      # DESKTOP_VERSION cannot clobber each other. No run_attempt: a failed-job
+      # rerun must still read the previous attempt's objects.
+      - name: Upload unsigned app to RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # GNU tar parses "D:\..." as host:path on Git Bash — use POSIX form.
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          archive="$tmp/app-unsigned-$DESKTOP_VERSION.tar.gz"
+          tar czf "$archive" -C "$DESKTOP_PACKAGE_PATH/dist" win-unpacked
+          node .release-kit/scripts/r2-put.mjs \
+            --file "$archive" \
+            --bucket sign \
+            --key "$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/app-unsigned/$DESKTOP_VERSION.tar.gz" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
 
   # The Jenkins signing runner can reach the private signing service, while the
   # hosted Windows builder cannot. Sign the app directory before NSIS packs it.
-  # This job never checkouts the product repo — only the kit (scripts) plus
-  # the unsigned artifact.
+  # This job never checkouts the product repo — only the kit (scripts). The
+  # unsigned app arrives as a RustFS tar.
   sign-windows-app:
     needs: [publish-windows]
     if: ${{ always() && needs.publish-windows.result == 'success' }}
@@ -565,11 +580,21 @@ jobs:
         shell: bash
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
-      - name: Download unsigned app artifact
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          name: win-unpacked-${{ env.DESKTOP_VERSION }}
-          path: win-unpacked
+      # Inverse of the unsigned upload. Self-hosted mac: no cygpath.
+      - name: Download unsigned app from RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/app-unsigned-$DESKTOP_VERSION.tar.gz"
+          node scripts/s3-get.mjs \
+            --bucket sign \
+            --key "$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/app-unsigned/$DESKTOP_VERSION.tar.gz" \
+            --output "$archive" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
+          tar xzf "$archive"
 
       - name: Sign app executables via Jenkins
         shell: bash
@@ -585,15 +610,21 @@ jobs:
             node scripts/sign-windows-via-jenkins.mjs --exe "$exe"
           done < signing-targets.txt
 
-      - name: Upload signed app artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
-          path: win-unpacked/
-          # Same dotfile preservation as the unsigned upload — the installer
-          # payload is built from this directory.
-          include-hidden-files: true
-          retention-days: 1
+      # Same RustFS hop as the unsigned app — blob path is still the bottleneck.
+      - name: Upload signed app to RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/app-signed-$DESKTOP_VERSION.tar.gz"
+          tar czf "$archive" win-unpacked
+          node scripts/r2-put.mjs \
+            --file "$archive" \
+            --bucket sign \
+            --key "$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/app-signed/$DESKTOP_VERSION.tar.gz" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
 
   # Build the NSIS installer on Windows from the signed app directory. The
   # verification here prevents publishing an installer with unsigned core EXEs.
@@ -670,11 +701,24 @@ jobs:
           }
           NODE
 
-      - name: Download signed app artifact
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          name: win-unpacked-signed-${{ env.DESKTOP_VERSION }}
-          path: ${{ env.DESKTOP_PACKAGE_PATH }}/dist/win-unpacked
+      # Unpack into $DESKTOP_PACKAGE_PATH/dist so win-unpacked lands where
+      # the NSIS pack step already looks. cygpath: GNU tar on Git Bash.
+      - name: Download signed app from RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          archive="$tmp/app-signed-$DESKTOP_VERSION.tar.gz"
+          node .release-kit/scripts/s3-get.mjs \
+            --bucket sign \
+            --key "$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/app-signed/$DESKTOP_VERSION.tar.gz" \
+            --output "$archive" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
+          mkdir -p "$DESKTOP_PACKAGE_PATH/dist"
+          tar xzf "$archive" -C "$DESKTOP_PACKAGE_PATH/dist"
 
       - name: Verify signed app executables
         shell: pwsh
@@ -739,14 +783,38 @@ jobs:
             }
           }
 
-      - name: Upload unsigned installer artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: installer-unsigned-${{ env.DESKTOP_VERSION }}
-          path: |
-            ${{ env.DESKTOP_PACKAGE_PATH }}/dist/${{ env.INSTALLER_PREFIX }}-*-Setup.exe
-            ${{ env.DESKTOP_PACKAGE_PATH }}/dist/latest.yml
-          retention-days: 1
+      # Two objects (Setup.exe + latest.yml). Blob path to the sign runner is
+      # the same bottleneck; exact version-bound exe name, fail-loud.
+      - name: Upload unsigned installer to RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          exe="$DESKTOP_PACKAGE_PATH/dist/${INSTALLER_PREFIX}-${DESKTOP_VERSION}-x64-Setup.exe"
+          manifest="$DESKTOP_PACKAGE_PATH/dist/latest.yml"
+          if [ ! -f "$exe" ]; then
+            echo "::error ::Expected unsigned installer at $exe"
+            ls "$DESKTOP_PACKAGE_PATH/dist" || true
+            exit 1
+          fi
+          if [ ! -f "$manifest" ]; then
+            echo "::error ::Expected updater manifest at $manifest"
+            ls "$DESKTOP_PACKAGE_PATH/dist" || true
+            exit 1
+          fi
+          prefix="$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/installer-unsigned/$DESKTOP_VERSION"
+          node .release-kit/scripts/r2-put.mjs \
+            --file "$exe" \
+            --bucket sign \
+            --key "$prefix/$(basename "$exe")" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
+          node .release-kit/scripts/r2-put.mjs \
+            --file "$manifest" \
+            --bucket sign \
+            --key "$prefix/$(basename "$manifest")" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
 
   # Sign the Windows installer through the internal Jenkins job. Runs on the
   # self-hosted sign runner because Jenkins lives on the corporate network and
@@ -796,11 +864,28 @@ jobs:
         shell: bash
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
-      - name: Download unsigned installer artifact
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          name: installer-unsigned-${{ env.DESKTOP_VERSION }}
-          path: dist
+      # Land both objects under dist/, matching the existing sign/verify/upload
+      # steps that treat dist/ as the root.
+      - name: Download unsigned installer from RustFS
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          exe_name="${INSTALLER_PREFIX}-${DESKTOP_VERSION}-x64-Setup.exe"
+          prefix="$PRODUCT_SLUG/windows/runs/$GITHUB_RUN_ID/installer-unsigned/$DESKTOP_VERSION"
+          node scripts/s3-get.mjs \
+            --bucket sign \
+            --key "$prefix/$exe_name" \
+            --output "dist/$exe_name" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
+          node scripts/s3-get.mjs \
+            --bucket sign \
+            --key "$prefix/latest.yml" \
+            --output "dist/latest.yml" \
+            --endpoint "${{ secrets.RUSTFS_ENDPOINT }}"
 
       - name: Sign installer via Jenkins
         shell: bash

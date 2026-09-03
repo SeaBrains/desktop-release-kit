@@ -213,13 +213,18 @@ jobs:
       JENKINS_SIGN_URL: ${{ secrets.JENKINS_SIGN_URL }}
       JENKINS_SIGN_USER: ${{ secrets.JENKINS_SIGN_USER }}
       JENKINS_SIGN_TOKEN: ${{ secrets.JENKINS_SIGN_TOKEN }}
+      RUSTFS_ENDPOINT: ${{ secrets.RUSTFS_ENDPOINT }}
+      RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+      RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
 ```
 
 `node-version`（默认 `22.23.2`）、`tag-prefix`（默认 `desktop-v`）、`upstream-manifest` / `upstream-submodule`（默认空，跳过 pin 校验）、`verify-published-bytes`（默认 `2000000`；设 `0` 则完整下载并逐个校验 sha512，慢但最严）可省略。
 
 ## 3. Secrets
 
-11 个：`APPLE_CERTIFICATE`（p12 的 base64）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`（应用专用密码）、`APPLE_TEAM_ID`、`MAC_CSC_NAME`、`CF_R2_ACCESS_KEY_ID`、`CF_R2_SECRET_ACCESS_KEY`、`JENKINS_SIGN_URL`、`JENKINS_SIGN_USER`、`JENKINS_SIGN_TOKEN`。
+14 个：`APPLE_CERTIFICATE`（p12 的 base64）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`（应用专用密码）、`APPLE_TEAM_ID`、`MAC_CSC_NAME`、`CF_R2_ACCESS_KEY_ID`、`CF_R2_SECRET_ACCESS_KEY`、`JENKINS_SIGN_URL`、`JENKINS_SIGN_USER`、`JENKINS_SIGN_TOKEN`、`RUSTFS_ENDPOINT`、`RUSTFS_ACCESS_KEY`、`RUSTFS_SECRET_KEY`。
+
+后三项是 `required: true`，**breaking change**：caller 切到含本改动的 kit ref 之前，必须先在产品仓库配好这三个 secrets，否则 workflow 过不了校验。它们走 Windows 签名链的中间对象（`sign` bucket，key `<slug>/windows/runs/<run_id>/…`），用来绕开自托管签名 runner 到 Azure blob 的不可靠通路。RustFS 对象没有 artifact 的 1 天自动过期，`sign` bucket 需自行配置针对 `<slug>/windows/runs/` 前缀的生命周期清理。
 
 **配在 repo 级，不要只配 org 级。** GitHub Free 计划的组织里，org secret 的 `visibility: private` / `selected` 对 private 仓库**不生效** —— API 能创建、能查到，但运行时注入的是空字符串。只有 `all` 且仓库是 public 才有效。
 
@@ -237,7 +242,7 @@ gh api orgs/<org> -q '.plan.name'   # free → 必须 repo 级；team/enterprise
 
 ## 4. Self-hosted `sign` runner
 
-label `sign`，能访问内网 Jenkins 签名服务。签名 job **不 checkout 产品仓库**，只拉 kit 脚本 + GitHub Artifacts。
+label `sign`，能访问内网 Jenkins 签名服务。签名 job **不 checkout 产品仓库**，只拉 kit 脚本；Windows 中间产物走 RustFS，mac/win updater manifest 仍走 GitHub Artifacts。
 
 ## 5. 发布验收
 
