@@ -115,6 +115,10 @@ on:
         required: true
       RUSTFS_SECRET_KEY:
         required: true
+      # Optional: token for private packages on GitHub Packages. Callers
+      # without private deps omit it; the auth step no-ops cleanly.
+      PACKAGES_READ_TOKEN:
+        required: false
 
 concurrency:
   group: desktop-release-${{ inputs['product-slug'] }}-${{ github.ref_name }}
@@ -268,6 +272,17 @@ jobs:
 
       - name: Enable Corepack
         run: corepack enable
+
+      # Optional: write GitHub Packages registry auth when the caller passes
+      # PACKAGES_READ_TOKEN. Callers without it no-op cleanly.
+      - name: Authenticate npm registry
+        shell: bash
+        env:
+          PACKAGES_READ_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+        run: |
+          if [[ -n "${PACKAGES_READ_TOKEN:-}" ]]; then
+            echo "//npm.pkg.github.com/:_authToken=${PACKAGES_READ_TOKEN}" >> ~/.npmrc
+          fi
 
       - name: Install JS dependencies
         run: ${{ env.INSTALL_COMMAND }}
@@ -500,6 +515,17 @@ jobs:
       - name: Enable Corepack
         run: corepack enable
 
+      # Optional: write GitHub Packages registry auth when the caller passes
+      # PACKAGES_READ_TOKEN. Callers without it no-op cleanly.
+      - name: Authenticate npm registry
+        shell: bash
+        env:
+          PACKAGES_READ_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+        run: |
+          if [[ -n "${PACKAGES_READ_TOKEN:-}" ]]; then
+            echo "//npm.pkg.github.com/:_authToken=${PACKAGES_READ_TOKEN}" >> ~/.npmrc
+          fi
+
       - name: Install JS dependencies
         run: ${{ env.INSTALL_COMMAND }}
 
@@ -688,6 +714,17 @@ jobs:
 
       - name: Enable Corepack
         run: corepack enable
+
+      # Optional: write GitHub Packages registry auth when the caller passes
+      # PACKAGES_READ_TOKEN. Callers without it no-op cleanly.
+      - name: Authenticate npm registry
+        shell: bash
+        env:
+          PACKAGES_READ_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN }}
+        run: |
+          if [[ -n "${PACKAGES_READ_TOKEN:-}" ]]; then
+            echo "//npm.pkg.github.com/:_authToken=${PACKAGES_READ_TOKEN}" >> ~/.npmrc
+          fi
 
       - name: Install JS dependencies
         run: ${{ env.INSTALL_COMMAND }}
