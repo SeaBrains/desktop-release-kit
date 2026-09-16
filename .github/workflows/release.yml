@@ -86,6 +86,16 @@ on:
         required: false
         type: string
         default: ""
+      app-env:
+        description: "Value exported as APP_ENV to every build step, so the product's build config bakes the matching backend into the artifact. Empty (the default) exports an empty APP_ENV, which build configs should treat the same as unset."
+        required: false
+        type: string
+        default: ""
+      create-github-release:
+        description: "Create a GitHub release for the tag. Disable for internal tracks whose normalized tag (e.g. test-v1.2.3 -> v1.2.3) would collide with the public track's release of the same version."
+        required: false
+        type: boolean
+        default: true
     secrets:
       APPLE_CERTIFICATE:
         required: true
@@ -143,6 +153,9 @@ env:
   INSTALL_COMMAND: ${{ inputs['install-command'] }}
   BUILD_COMMAND: ${{ inputs['build-command'] }}
   WORKSPACE_RUN_PREFIX: ${{ inputs['workspace-run-prefix'] }}
+  # Exported globally so both platform build steps inherit it; the product's
+  # build config selects its .env.<APP_ENV> from this.
+  APP_ENV: ${{ inputs['app-env'] }}
 
 jobs:
   create-release:
@@ -194,7 +207,10 @@ jobs:
         shell: bash
         run: node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
 
+      # Internal tracks skip this: their normalized tag (test-v1.2.3 -> v1.2.3)
+      # would create/collide with the public track's release of the same version.
       - name: Create GitHub release
+        if: ${{ inputs['create-github-release'] }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
