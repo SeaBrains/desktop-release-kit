@@ -1,0 +1,162 @@
+name: Mirror desktop downloads to China OSS
+
+on:
+  workflow_call:
+    inputs:
+      source-base:
+        description: Existing overseas feed directory for this exact product and channel.
+        required: true
+        type: string
+      target-prefix:
+        description: Independent product/channel directory in the China bucket.
+        required: true
+        type: string
+      manifests:
+        description: Space separated manifest filenames emitted by the product release.
+        required: false
+        type: string
+        default: ""
+      platform:
+        description: Platform to mirror when using the standard latest/rc manifests.
+        required: false
+        type: string
+        default: all
+      extra-artifacts:
+        description: JSON files entries for signed macOS installers absent from the upstream updater manifest.
+        required: false
+        type: string
+        default: "[]"
+      version:
+        required: false
+        type: string
+        default: ""
+      source-tag:
+        required: false
+        type: string
+        default: ""
+      bucket:
+        required: false
+        type: string
+        default: seabrains-data-download
+      region:
+        required: false
+        type: string
+        default: cn-shanghai
+      downloads-base:
+        required: false
+        type: string
+        default: https://download.seabrains.cn
+      kit-ref:
+        description: Release kit revision containing this workflow and its scripts.
+        required: false
+        type: string
+        default: main
+    secrets:
+      OSS_ACCESS_KEY_ID:
+        required: true
+      OSS_ACCESS_KEY_SECRET:
+        required: true
+  workflow_dispatch:
+    inputs:
+      source-base:
+        description: Overseas feed directory to mirror without rebuilding a release.
+        required: true
+        type: string
+      target-prefix:
+        description: China product/channel directory.
+        required: true
+        type: string
+      manifests:
+        description: Explicit manifest filenames, or empty for latest/rc.
+        required: false
+        type: string
+        default: ""
+      platform:
+        required: false
+        type: choice
+        options: [all, macos, windows]
+        default: all
+      version:
+        description: Exact already-published version to copy.
+        required: true
+        type: string
+      extra-artifacts:
+        required: false
+        type: string
+        default: "[]"
+      bucket:
+        required: false
+        type: string
+        default: seabrains-data-download
+      region:
+        required: false
+        type: string
+        default: cn-shanghai
+      downloads-base:
+        required: false
+        type: string
+        default: https://download.seabrains.cn
+
+concurrency:
+  group: oss-mirror-${{ inputs.bucket }}-${{ inputs.target-prefix }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: SeaBrains/desktop-release-kit
+          ref: ${{ inputs.kit-ref || github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+      - name: Install manifest parser and verified OSS CLI
+        run: |
+          set -euo pipefail
+          npm install --prefix scripts --no-save --package-lock=false --ignore-scripts yaml@2
+          curl --fail --show-error --silent --location --retry 3 \
+            https://gosspublic.alicdn.com/ossutil/v2/2.4.0/ossutil-2.4.0-linux-amd64.zip \
+            -o "$RUNNER_TEMP/ossutil.zip"
+          echo "85edf66b2fb7238f5c7e25cab820cf29312319fe4935b7c86a6b8485eb434f3c  $RUNNER_TEMP/ossutil.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/ossutil.zip" -d "$RUNNER_TEMP/ossutil"
+          chmod +x "$RUNNER_TEMP/ossutil/ossutil-2.4.0-linux-amd64/ossutil"
+          echo "$RUNNER_TEMP/ossutil/ossutil-2.4.0-linux-amd64" >> "$GITHUB_PATH"
+      - name: Copy and hash artifacts before promoting China pointers
+        id: mirror
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_REGION: ${{ inputs.region }}
+          SOURCE_BASE: ${{ inputs.source-base }}
+          TARGET_PREFIX: ${{ inputs.target-prefix }}
+          MANIFESTS: ${{ inputs.manifests }}
+          PLATFORM: ${{ inputs.platform }}
+          EXTRA_ARTIFACTS: ${{ inputs.extra-artifacts }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_TAG: ${{ inputs.source-tag }}
+          OSS_BUCKET: ${{ inputs.bucket }}
+          DOWNLOADS_BASE: ${{ inputs.downloads-base }}
+        run: |
+          set -euo pipefail
+          node scripts/mirror-release-to-oss.mjs \
+            --source-base "$SOURCE_BASE" --target-base "$DOWNLOADS_BASE" \
+            --prefix "$TARGET_PREFIX" --manifests "$MANIFESTS" \
+            --platform "$PLATFORM" \
+            --extra-artifacts "$EXTRA_ARTIFACTS" \
+            --version "$RELEASE_VERSION" --source-tag "$SOURCE_TAG" \
+            --bucket "$OSS_BUCKET" --region "$OSS_REGION" \
+            --receipt "$RUNNER_TEMP/oss-mirror.json"
+          echo "artifact-name=oss-mirror-${TARGET_PREFIX//\//-}-${PLATFORM}-${MANIFESTS// /-}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Retain verified China download addresses
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.mirror.outputs.artifact-name }}
+          path: ${{ runner.temp }}/oss-mirror.json
+          if-no-files-found: error
