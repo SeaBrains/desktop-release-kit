@@ -31,3 +31,20 @@ test("getReleaseInfoFromSourceTag accepts RELEASE_TAG_PREFIX", () => {
     else process.env.RELEASE_TAG_PREFIX = previous;
   }
 });
+
+test("regional release tags preserve their version and RC channel", () => {
+  const previous = process.env.RELEASE_TAG_PREFIX;
+  try {
+    for (const prefix of ["cn-v", "cn-test-v"]) {
+      process.env.RELEASE_TAG_PREFIX = prefix;
+      const info = getReleaseInfoFromSourceTag(`${prefix}0.9.1-rc.2`);
+      assert.equal(info.sourceTag, `${prefix}0.9.1-rc.2`);
+      assert.equal(info.version, "0.9.1-rc.2");
+      assert.equal(info.isPrerelease, true);
+      assert.equal(info.isReleaseCandidate, true);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.RELEASE_TAG_PREFIX;
+    else process.env.RELEASE_TAG_PREFIX = previous;
+  }
+});

@@ -1,0 +1,38 @@
+name: Verify direct OSS publishing
+
+on:
+  workflow_call:
+    inputs:
+      kit-ref:
+        required: true
+        type: string
+    secrets:
+      OSS_ACCESS_KEY_ID:
+        required: true
+      OSS_ACCESS_KEY_SECRET:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: SeaBrains/desktop-release-kit
+          ref: ${{ inputs.kit-ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+      - run: npm ci --prefix scripts
+      - run: npm test
+      - run: node scripts/setup-ossutil.mjs
+      - name: Upload local fixtures, verify pointers and clean up
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: node scripts/smoke-direct-oss.mjs
