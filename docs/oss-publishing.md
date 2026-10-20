@@ -1,58 +1,55 @@
-# 国内与海外同时分发
+# 国内与海外独立发布
 
-海外发布流程继续生成、签名和发布原有 R2 产物。各产品在海外发布成功后调用 `.github/workflows/mirror-oss.yml`，把对应版本同步到阿里云 OSS `seabrains-data-download`（`cn-shanghai`），通过 `https://download.seabrains.cn` 分发。复制不改变安装包字节、签名、产品身份或账号环境。
+地区是独立的发布维度，国内和海外可以使用不同版本与不同代码提交。不要把海外每次发布自动同步成国内最新版。调用方决定地区、生产/测试环境、版本与更新源，release kit 复用签名和打包流程。
 
-| 产品 / 渠道                    | 国内目录                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------- |
-| SeaWork 2.x                    | `seawork/`                                                                 |
-| SeaWork 3.x                    | `seawork/alpha/`、`seawork/beta/`、`seawork/stable/`，由产品发布元数据决定 |
-| SeaDesign 内部测试 / 生产      | `seadesign/`、`seadesign-release/`                                         |
-| VideoFlow 海外版 / 国内版      | `videoflow-desktop/`、`videoflow-desktop-cn/`                              |
-| SeaHarness                     | `seaharness/`                                                              |
-| SeaGames 官方 / SeaBrains 分发 | `seagame/`、`seagame/seabrain/`，各自的测试版再加 `test/`                  |
+## SeaDesign 的地区与渠道
 
-发布调用方显式传入源目录、目标目录、版本以及清单名称。SeaWork 3.x 的渠道和清单名继续从 `@seawork/protocol` 生成的发布元数据读取；SeaGame 的账号分发渠道与测试/生产渠道继续从其发布元数据读取。两个维度不能互相替代。没有已发布产物的渠道保持不存在。
+| 地区 / 环境 | Tag 前缀    | 更新源                                               |
+| ----------- | ----------- | ---------------------------------------------------- |
+| 海外生产    | `v`         | `https://downloads.seabrains.ai/seadesign-release`   |
+| 海外测试    | `test-v`    | `https://downloads.seabrains.ai/seadesign`           |
+| 国内生产    | `cn-v`      | `https://download.seabrains.cn/seadesign-cn-release` |
+| 国内测试    | `cn-test-v` | `https://download.seabrains.cn/seadesign-cn`         |
 
-## Actions 凭证与接入
+`APP_REGION` 与 `APP_ENV` 传给两个平台的构建步骤，由产品把对应更新源烧入客户端。国内构建使用独立的 R2 目录 `seadesign-cn` / `seadesign-cn-release` 暂存签名产物，再调用 `.github/workflows/mirror-oss.yml`，将这个国内构建发布到 OSS 的同名目录。海外发布不运行国内 OSS job。暂存目录即使位于海外 CDN，也不属于海外版的更新流。
 
-调用方仓库配置 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` 两个 GitHub Actions Secrets，并通过 reusable workflow 的 `secrets` 参数传入。手动补发时这两个 Secrets 也要配置到 release kit 仓库。凭证只注入上传步骤的进程环境，不写进下载清单、脚本参数或产物。
+正式版与 RC 是每个地区、环境内部的渠道：正式版写 `latest-mac.yml` / `latest.yml`，`-rc.N` 版本写 `rc-mac.yml` / `rc.yml`；安装包在该目录的 `<版本>/` 下。四组目录互不覆盖。国内轨不创建归一化的 GitHub Release，避免 `cn-vX.Y.Z` 被归一化为 `vX.Y.Z` 后与海外同号 Release 冲突。
 
-首次发布这份 kit 后，应把调用方的 `mirror-oss.yml@main` 和 `with.kit-ref` 同时固定到包含该工作流及脚本的同一提交。原有签名发布工作流的固定版本不需要修改。
+历史的 `download.seabrains.cn/seadesign/` 只是同版本镜像试验，不是独立国内版。其他产品接入时也应按其已有地区、版本与环境规则选择目录，不能仅因同属一个产品就共用更新指针。
+
+## Actions 接入
+
+调用方仓库配置 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` 两个 Actions Secrets，仅传入 OSS 上传 job。桶为 `seabrains-data-download`，区域为 `cn-shanghai`，公共域名为 `https://download.seabrains.cn`。凭证不进入清单、命令参数或产物。
+
+产品先解析并校验 tag，再给签名工作流传入 `product-slug`、`tag-prefix`、`app-region`、`app-env`、`create-github-release`；国内版本使用独立的 product slug。签名工作流和 OSS 工作流的 `uses` 与各自 `kit-ref` 必须固定到包含相应接口的提交。
 
 ```yaml
 mirror-china:
-  needs: release
+  needs: [target, release]
+  if: ${{ needs.target.outputs.app_region == 'cn' && needs.release.result == 'success' && (github.event_name == 'push' || inputs.platform == 'all') }}
   permissions:
     contents: read
-  uses: SeaBrains/desktop-release-kit/.github/workflows/mirror-oss.yml@main
+  uses: SeaBrains/desktop-release-kit/.github/workflows/mirror-oss.yml@<kit-sha>
   with:
-    source-base: https://downloads.seabrains.ai/seadesign-release
-    target-prefix: seadesign-release
-    source-tag: ${{ inputs.tag || github.ref_name }}
-    kit-ref: main
+    source-base: ${{ needs.target.outputs.staging_base }}/${{ needs.target.outputs.product_slug }}
+    target-prefix: ${{ needs.target.outputs.product_slug }}
+    source-tag: ${{ needs.target.outputs.source_tag }}
+    kit-ref: <kit-sha>
   secrets:
     OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
     OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 ```
 
-只有双平台完成后才晋级清单的调用方，镜像 job 也只在双平台发布时运行。独立发布平台的调用方分别传入该平台的清单。macOS 的人工安装 DMG 若未列在旧更新清单中，由原发布 job 提供带 SHA512 和大小的 `extra-artifacts`；它会加入国内 macOS 清单。
+双平台发布完成后才晋级清单，补发单个平台不更新公共清单。macOS 的人工安装 DMG 若未列在旧更新清单中，可传入含 SHA512 和大小的 `extra-artifacts`，它会加入国内 macOS 清单。
 
 ## 校验和晋级
 
-脚本拒绝版本不一致、跨源或越过版本目录的产物路径、HTML 下载结果以及 SHA512 不匹配。它复制清单中的 ZIP、DMG、EXE、NSIS packages 及已有的外部 blockmap，逐个通过国内域名完整下载并核对 SHA512。所有文件通过后才写入国内清单；正式版还同步源站已存在且同版本的 `desktop-version.json`。
+OSS 脚本拒绝版本不一致、跨源或越过版本目录的产物路径、HTML 下载结果以及 SHA512 不匹配。它复制清单中的 ZIP、DMG、EXE、NSIS packages 及已有的外部 blockmap，逐个通过国内域名完整下载并核对 SHA512。所有文件通过后才晋级国内清单；正式版还同步源站已存在且同版本的 `desktop-version.json`。
 
-版本目录对象禁止覆盖；重复执行会验证并复用相同字节。清单使用 `no-cache`，且拒绝把已有清单降到更低版本。国内清单的文件地址改为版本相对路径，客户端不会经由清单再次跳回海外 CDN。失败的镜像 job 不影响已成功的海外发布，可单独重跑。
-
-已有版本可以直接补发，不重新构建、签名或调用通知步骤：
-
-```bash
-gh workflow run mirror-oss.yml --repo SeaBrains/desktop-release-kit \
-  -f source-base=https://downloads.seabrains.ai/seadesign \
-  -f target-prefix=seadesign -f version=0.9.0 -f platform=all
-```
+版本目录对象禁止覆盖；重复执行会验证并复用相同字节。清单使用 `no-cache`，拒绝降到更低版本。国内清单使用版本相对路径，客户端下载不会再跳回海外暂存目录。OSS 发布失败可单独重跑；国内客户端在 OSS 校验完成前继续使用原来的国内清单。
 
 ## 客户端与官网
 
-国内官网从 `.env.production-cn` / `.env.development-cn` 读取国内来源；指定 RC、Alpha 等渠道时使用 `{ "manifestBaseUrl": "…", "channel": "rc" }`。海外环境文件继续使用原来源。清单不存在的平台不展示下载按钮。
+官网的国内环境应读取对应国内目录；海外环境保留海外目录。RC 下载使用同目录的 `rc` 渠道。清单尚不存在的平台不展示下载按钮。
 
-镜像现存安装包不会改写其包内更新源。VideoFlow 国内版的下一次构建已改用国内 OSS feed。SeaDesign 已支持通过构建变量 `SEA_DESIGN_UPDATE_FEED` 指定 feed。SeaHarness 的更新检查受后端版本分发策略控制，必须由后端把返回清单的绝对文件 URL 配为国内域名，不能把其检查接口替换为静态 OSS 来跳过策略。现存客户端是否以及如何选择地区，需要与各产品原有构建渠道一起交付。
+复制已有海外安装包只改变下载入口，不改变包内更新源或账号服务。独立国内版必须重新构建并内置国内 feed。地区服务端地址由产品配置，不能从 OSS 域名推导；SeaDesign 支持 `.env.<环境>-cn` 覆盖服务配置，尚未设置的项目沿用原环境配置。

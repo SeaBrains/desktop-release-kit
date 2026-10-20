@@ -96,6 +96,11 @@ on:
         required: false
         type: boolean
         default: true
+      app-region:
+        description: "Optional APP_REGION exported to both platform builds. Products define their supported regions and select the matching update feed."
+        required: false
+        type: string
+        default: ""
     secrets:
       APPLE_CERTIFICATE:
         required: true
@@ -156,6 +161,7 @@ env:
   # Exported globally so both platform build steps inherit it; the product's
   # build config selects its .env.<APP_ENV> from this.
   APP_ENV: ${{ inputs['app-env'] }}
+  APP_REGION: ${{ inputs['app-region'] }}
 
 jobs:
   create-release:

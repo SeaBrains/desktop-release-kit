@@ -33,6 +33,7 @@ test("release identity keeps production, RC and platform tag prefixes intact", (
   for (const prefix of [
     "v",
     "cn-v",
+    "cn-test-v",
     "test-v",
     "desktop-mac-v",
     "desktop-windows-v",
